@@ -1,0 +1,8 @@
+{
+  "name": "photopea-render-service",
+  "version": "1.0.0",
+  "description": "Headless Photopea render service — replaces smart-object and text layers in a PSD and returns the rendered image.",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": { "express": "^4.19.2", "puppeteer": "^22.15.0" }
+}
