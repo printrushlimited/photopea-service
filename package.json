@@ -1,8 +1,14 @@
 {
   "name": "photopea-render-service",
-  "version": "1.0.0",
-  "description": "Headless Photopea render service — replaces smart-object and text layers in a PSD and returns the rendered image.",
+  "version": "2.0.0",
+  "description": "PSD render service using ag-psd for server-side smart-object and text-layer replacement — no browser required.",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "dependencies": { "express": "^4.19.2", "puppeteer": "^22.15.0" }
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.65",
+    "ag-psd": "^19.2.1",
+    "express": "^4.19.2"
+  }
 }
