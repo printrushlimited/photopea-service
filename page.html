@@ -11,6 +11,18 @@
 
   <script>
   /**
+   * Global message buffer: captures every postMessage from Photopea as soon as
+   * the page loads, so ready signals fired BEFORE runRender attaches its listener
+   * are not lost (fixes the "Timeout waiting for: done" race).
+   */
+  window.__ppMessages = [];
+  window.__ppSeen = new Set();
+  window.addEventListener('message', (e) => {
+    const key = (typeof e.data === 'string') ? e.data : (e.data instanceof ArrayBuffer ? '__ab__' : JSON.stringify(e.data));
+    if (!window.__ppSeen.has(key)) { window.__ppSeen.add(key); window.__ppMessages.push(key); }
+  });
+
+  /**
    * Drives Photopea to render a PSD with layer replacements.
    * @param {Object} params
    * @param {string} params.psd_url        - public URL of the PSD file
@@ -22,9 +34,11 @@
     const { psd_url, output_format, replacements } = params;
     const pp = document.getElementById('pp').contentWindow;
 
-    // Wait for a specific string marker from Photopea (via app.echoToOE)
+    // Wait for a specific string marker from Photopea (via app.echoToOE).
+    // Checks the buffered history first so an early signal is not missed.
     const waitFor = (target, timeoutMs = 120000) => new Promise((resolve, reject) => {
-      const to = setTimeout(() => { cleanup(); reject(new Error('Timeout waiting for: ' + target)); }, timeoutMs);
+      if (window.__ppSeen.has(target)) return resolve();
+      const to = setTimeout(() => { cleanup(); reject(new Error('Timeout waiting for: ' + target + ' | seen: ' + window.__ppMessages.slice(-12).join(', '))); }, timeoutMs);
       const h = (e) => { if (e.data === target) { cleanup(); resolve(); } };
       const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
       window.addEventListener('message', h);
