@@ -455,6 +455,14 @@ function replaceText(layer, text) {
   const startY = Math.max(0, (h - totalHeight) / 2);
   const x = alignment === 'center' ? w / 2 : alignment === 'right' ? w : 0;
 
+  // Draw a small test rect to verify the canvas context works at all
+  ctx.fillStyle = 'red';
+  ctx.fillRect(0, 0, 10, 10);
+  const testRectPx = ctx.getImageData(5, 5, 1, 1).data;
+
+  // Reset fill style for text
+  ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
+
   lines.forEach((line, i) => {
     ctx.fillText(line, x, startY + i * lineHeight);
   });
@@ -479,6 +487,7 @@ function replaceText(layer, text) {
     registered_families: GlobalFonts.families.length,
     family_names: GlobalFonts.families.map(f => f.family),
     pixel_grid: samples,
+    test_rect_pixel: [testRectPx[0], testRectPx[1], testRectPx[2], testRectPx[3]],
   };
 }
 
