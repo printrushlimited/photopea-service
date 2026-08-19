@@ -76,8 +76,8 @@ async function ensureFontsAvailable() {
   // Multiple sources in case one fails. Roboto from Google's official fonts
   // repo (OFL) is reliable and has full Latin coverage.
   const fontSources = [
-    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosans/NotoSans-Regular.ttf', path: '/tmp/NotoSans-Regular.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'Noto Sans'] },
-    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosans/NotoSans-Bold.ttf', path: '/tmp/NotoSans-Bold.ttf', aliases: ['Arial Bold', 'Noto Sans Bold'] },
+    { url: 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf', path: '/tmp/DejaVuSans.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'DejaVu Sans'] },
+    { url: 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf', path: '/tmp/DejaVuSans-Bold.ttf', aliases: ['Arial Bold', 'DejaVu Sans Bold'] },
   ];
   for (const f of fontSources) {
     try {
@@ -481,6 +481,10 @@ function replaceArtwork(layer, img) {
   ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
 
   layer.canvas = canvas;
+  // Override blend mode to 'normal' — the original blend mode (e.g. 'linear
+  // burn') was designed for the ORIGINAL artwork content, not our replacement.
+  // Keeping it would darken the artwork and hide its colors.
+  layer.blendMode = 'normal';
 
   // Sample center pixel to verify artwork was drawn
   const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
