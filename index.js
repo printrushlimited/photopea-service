@@ -259,8 +259,11 @@ async function processRender(jobId, params) {
     for (let i = 0; i < layers.length; i++) {
       const layer = layers[i];
       if (layer.hidden) continue;
-      // Children are within the group — draw them first (also forward)
-      if (layer.children) drawLayers(layer.children);
+      // Group layer: draw children and SKIP the group's own pre-rendered
+      // canvas. ag-psd composites group canvases at parse time — they contain
+      // stale pre-replacement artwork AND would double-composite every child
+      // (doubling shadows, darkening the whole image).
+      if (layer.children) { drawLayers(layer.children); continue; }
 
       // Apply replacements by matching layer name
       for (const rep of replacements) {
