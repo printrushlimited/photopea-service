@@ -65,6 +65,42 @@ app.get('/status/:jobId', (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, engine: 'ag-psd' }));
 
+// Diagnostic: list all layer names in a PSD (case-sensitive) so admins can
+// verify their layer mappings match exactly.
+app.post('/layers', async (req, res) => {
+  try {
+    const { psd_url } = req.body || {};
+    if (!psd_url) return res.status(400).json({ error: 'psd_url is required' });
+
+    const psdRes = await fetch(psd_url);
+    if (!psdRes.ok) return res.status(400).json({ error: `PSD download failed (${psdRes.status})` });
+    const psdBuffer = Buffer.from(await psdRes.arrayBuffer());
+    const psd = readPsd(psdBuffer);
+
+    const layers = [];
+    function walk(ls, depth) {
+      if (!ls) return;
+      for (const layer of ls) {
+        const w = (layer.right || 0) - (layer.left || 0);
+        const h = (layer.bottom || 0) - (layer.top || 0);
+        layers.push({
+          name: layer.name,
+          depth,
+          type: layer.text ? 'text' : layer.children ? 'group' : layer.smartObject ? 'smart_object' : 'pixel',
+          hidden: !!layer.hidden,
+          has_canvas: !!layer.canvas,
+          bounds: w > 0 && h > 0 ? { w, h, left: layer.left, top: layer.top } : null,
+        });
+        if (layer.children) walk(layer.children, depth + 1);
+      }
+    }
+    walk(psd.children || [], 0);
+    return res.json({ width: psd.width, height: psd.height, layers });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 async function loadImageFromUrl(url) {
@@ -132,7 +168,19 @@ async function processRender(jobId, params) {
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, psd.width, psd.height);
 
+  // Collect all layer names for diagnostics
+  const allLayerNames = [];
+  function collectNames(layers) {
+    if (!layers) return;
+    for (const layer of layers) {
+      allLayerNames.push(layer.name);
+      if (layer.children) collectNames(layer.children);
+    }
+  }
+  collectNames(psd.children || []);
+
   let applied = 0;
+  const matchLog = [];
   function drawLayers(layers) {
     if (!layers || layers.length === 0) return;
     for (let i = layers.length - 1; i >= 0; i--) {
@@ -144,15 +192,24 @@ async function processRender(jobId, params) {
       // Apply replacements by matching layer name
       for (const rep of replacements) {
         if (layer.name !== rep.layer_name) continue;
+        const w = (layer.right || 0) - (layer.left || 0);
+        const h = (layer.bottom || 0) - (layer.top || 0);
         try {
           if (rep.type === 'text') {
+            if (w <= 0 || h <= 0) { matchLog.push({ rep: rep.layer_name, status: 'skipped_no_bounds' }); continue; }
             replaceText(layer, rep.text);
             applied++;
+            matchLog.push({ rep: rep.layer_name, status: 'applied_text' });
           } else if (rep.type === 'artwork') {
             const img = artworkCache.get(rep.image_url);
-            if (img) { replaceArtwork(layer, img); applied++; }
+            if (!img) { matchLog.push({ rep: rep.layer_name, status: 'no_artwork_image' }); continue; }
+            if (w <= 0 || h <= 0) { matchLog.push({ rep: rep.layer_name, status: 'skipped_no_bounds' }); continue; }
+            replaceArtwork(layer, img);
+            applied++;
+            matchLog.push({ rep: rep.layer_name, status: 'applied_artwork' });
           }
         } catch (e) {
+          matchLog.push({ rep: rep.layer_name, status: 'error', error: e.message });
           console.error(`[${jobId}] replace "${layer.name}": ${e.message}`);
         }
       }
@@ -173,6 +230,16 @@ async function processRender(jobId, params) {
   }
 
   drawLayers(psd.children || []);
+
+  // Log unmatched replacements
+  for (const rep of replacements) {
+    if (!allLayerNames.includes(rep.layer_name)) {
+      matchLog.push({ rep: rep.layer_name, status: 'NO_MATCH', available: allLayerNames });
+    }
+  }
+
+  console.log(`[${jobId}] layers found: ${JSON.stringify(allLayerNames)}`);
+  console.log(`[${jobId}] match log: ${JSON.stringify(matchLog)}`);
   console.log(`[${jobId}] composited (${applied}/${replacements.length} replacements applied)`);
 
   // 5. Export to PNG or JPEG
@@ -181,7 +248,7 @@ async function processRender(jobId, params) {
     : composite.toBuffer('image/jpeg', 85);
 
   const b64 = outBuffer.toString('base64');
-  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, startedAt: jobs.get(jobId).startedAt });
+  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, startedAt: jobs.get(jobId).startedAt });
   console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64)`);
 }
 
