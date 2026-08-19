@@ -133,6 +133,29 @@ async function processRender(jobId, params) {
     // Load a blank shell, then create a Photopea iframe (no hash config).
     // Drive Photopea via postMessage: wait for "done", open PSD, run script,
     // then saveToOE posts the ArrayBuffer to window.parent (this shell).
+    // Inject a localStorage shim into EVERY frame (including the cross-origin
+    // Photopea iframe) before any page script runs. Headless Chrome blocks
+    // localStorage for opaque-origin / partitioned third-party iframes, which
+    // crashes Photopea during init — it never sends the "done" signal.
+    await page.evaluateOnNewDocument(() => {
+      try {
+        const _ = window.localStorage;
+      } catch {
+        const store = {};
+        Object.defineProperty(window, 'localStorage', {
+          value: {
+            getItem: (k) => (k in store ? store[k] : null),
+            setItem: (k, v) => { store[k] = String(v); },
+            removeItem: (k) => { delete store[k]; },
+            clear: () => { Object.keys(store).forEach((k) => delete store[k]); },
+            key: (i) => Object.keys(store)[i] ?? null,
+            get length() { return Object.keys(store).length; },
+          },
+          configurable: true,
+        });
+      }
+    });
+
     await page.goto('http://localhost:' + PORT + '/shell', { waitUntil: 'load', timeout: 60000 });
     console.log(`[${jobId}] creating Photopea iframe (${replacements.length} replacement(s))`);
 
