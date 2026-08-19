@@ -68,6 +68,31 @@ for (const p of systemFontPaths) {
 console.log(`Fonts registered: ${fontsRegistered} alias entries`);
 console.log(`Available font families: ${JSON.stringify(GlobalFonts.families.map(f => f.family))}`);
 
+// If no system fonts were found, download DejaVu Sans from a CDN and register
+// it under common aliases. Without this, ctx.fillText() draws nothing.
+async function ensureFontsAvailable() {
+  if (GlobalFonts.families.length > 0) return;
+  console.log('No system fonts found — downloading DejaVu Sans…');
+  const fontUrls = [
+    { url: 'https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans.ttf', path: '/tmp/DejaVuSans.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'DejaVu Sans'] },
+    { url: 'https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf', path: '/tmp/DejaVuSans-Bold.ttf', aliases: ['Arial Bold', 'DejaVu Sans Bold'] },
+  ];
+  for (const f of fontUrls) {
+    try {
+      const res = await fetch(f.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      fs.writeFileSync(f.path, Buffer.from(await res.arrayBuffer()));
+      for (const alias of f.aliases) {
+        try { GlobalFonts.registerFromPath(f.path, alias); } catch (e) { /* ignore */ }
+      }
+      console.log(`Registered ${f.path} as: ${f.aliases.join(', ')}`);
+    } catch (e) {
+      console.warn(`Failed to download font from ${f.url}: ${e.message}`);
+    }
+  }
+  console.log(`After download: ${GlobalFonts.families.length} font families`);
+}
+
 const app = express();
 app.use(express.json({ limit: '256mb' }));
 
@@ -200,9 +225,9 @@ async function processRender(jobId, params) {
   }
 
   // 4. Walk layers (bottom-to-top), apply replacements, composite to one canvas.
-  //    PSD stores layers top-to-bottom (first child = topmost), but canvas
-  //    compositing draws later operations on top — so iterate in REVERSE
-  //    (bottommost layer first, topmost last).
+  //    ag-psd stores children in PSD file order: first child = bottommost layer.
+  //    Canvas compositing draws later operations on top, so iterate FORWARD
+  //    (bottommost first, topmost last) to match the visual layer order.
   const composite = createCanvas(psd.width, psd.height);
   const ctx = composite.getContext('2d');
 
@@ -226,10 +251,10 @@ async function processRender(jobId, params) {
   const matchLog = [];
   function drawLayers(layers) {
     if (!layers || layers.length === 0) return;
-    for (let i = layers.length - 1; i >= 0; i--) {
+    for (let i = 0; i < layers.length; i++) {
       const layer = layers[i];
       if (layer.hidden) continue;
-      // Children are within the group — draw them first (also in reverse)
+      // Children are within the group — draw them first (also forward)
       if (layer.children) drawLayers(layer.children);
 
       // Apply replacements by matching layer name
@@ -387,8 +412,15 @@ function replaceText(layer, text) {
   const style = t.style?.[0] || t.style || {};
   const paraStyle = t.paragraphStyle?.[0] || t.paragraphStyle || {};
 
-  const fontSize = Math.round(style.fontSize || t.fontSize || 24);
-  let fontName = style.font?.name || t.font?.name || 'Arial';
+  // PSD text layers store a transform matrix [a, b, c, d, tx, ty] that scales
+  // the text from its internal size to layer space. The style.fontSize is the
+  // UNSCALED size — we must multiply by the transform's scale factor (a or d)
+  // to get the actual rendered pixel size.
+  const transform = t.transform || [];
+  const transformScale = transform[0] || transform[3] || 1;
+  const baseFontSize = style.fontSize || t.fontSize || 24;
+  const fontSize = Math.round(baseFontSize * transformScale);
+  let fontName = style.font?.name || t.font?.name || style.fontFamily || t.fontFamily || 'Arial';
   // Map common PostScript font names to CSS families
   fontName = fontName.replace(/MT$|PS$|-Regular$|-Bold$|-Italic$|-BoldItalic$/g, '').replace(/-/g, ' ');
 
@@ -447,4 +479,6 @@ function replaceArtwork(layer, img) {
   return { scale, draw_dims: { w: dw, h: dh }, center_pixel: [px[0], px[1], px[2], px[3]] };
 }
 
-app.listen(PORT, () => console.log(`PSD render service (ag-psd) listening on :${PORT}`));
+ensureFontsAvailable().finally(() => {
+  app.listen(PORT, () => console.log(`PSD render service (ag-psd) listening on :${PORT}`));
+});
