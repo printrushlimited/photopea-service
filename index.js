@@ -113,9 +113,6 @@ async function processRender(jobId, { psd_url, output_format, replacements }) {
       '--enable-unsafe-swiftshader',
       '--use-gl=angle',
       '--use-angle=swiftshader',
-      '--disable-web-security',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--allow-running-insecure-content',
     ],
   });
 
@@ -128,28 +125,27 @@ async function processRender(jobId, { psd_url, output_format, replacements }) {
     page.on('console', msg => console.log(`[${jobId}] [page console] ${msg.type()}: ${msg.text()}`));
     page.on('pageerror', err => console.log(`[${jobId}] [page error] ${err.message}`));
 
-    // Set up page with Photopea iframe and message queue.
-    // The <script> runs synchronously during parsing BEFORE the iframe's
-    // network request completes, so the listener is ready when Photopea loads.
-    await page.setContent(`
-      <!DOCTYPE html>
-      <html><head><title>Photopea Render</title></head>
-      <body style="margin:0;padding:0;overflow:hidden;">
-        <iframe id="pe" src="https://www.photopea.com" style="width:100%;height:100vh;border:none;" allow="autoplay; camera; clipboard-read; clipboard-write"></iframe>
-        <script>
-          window.__msgQueue = [];
-          window.addEventListener('message', function(e) {
-            window.__msgQueue.push(e.data);
-          });
-        </script>
-      </body></html>
-    `);
+    // Load Photopea directly as the top-level page (not in an iframe).
+    // This gives Photopea a proper https://www.photopea.com origin with full
+    // localStorage access, which it needs to initialize. The previous iframe
+    // approach at about:blank caused "localStorage access denied" errors.
+    //
+    // Photopea communicates via postMessage:
+    //   - We send scripts via window.postMessage(script, '*')
+    //   - Photopea sends responses (echoToOE, saveToOE) via parent.postMessage()
+    //   - When Photopea is the top-level page, parent === window, so our
+    //     window message listener receives everything.
+    await page.evaluateOnNewDocument(() => {
+      window.__msgQueue = [];
+      window.addEventListener('message', function(e) {
+        window.__msgQueue.push(e.data);
+      });
+    });
 
-    // Wait for the iframe element to exist
-    await page.waitForSelector('#pe', { timeout: 10000 });
+    console.log(`[${jobId}] Navigating to Photopea…`);
+    await page.goto('https://www.photopea.com', { waitUntil: 'domcontentloaded', timeout: 120000 });
 
     // Wait for Photopea to initialize — it sends "done" when ready.
-    // Photopea is a heavy web app; in a container this can take 60-120s.
     console.log(`[${jobId}] Waiting for Photopea to initialize…`);
     await waitForMessage(page, 'done', 180000);
     console.log(`[${jobId}] Photopea ready`);
@@ -272,7 +268,7 @@ async function runScript(page, script, timeoutMs = 120000) {
   const wrapped = `try { ${script} } catch(e) { app.echoToOE("__ERROR:" + e.toString()); }`;
 
   await page.evaluate((s) => {
-    document.getElementById('pe').contentWindow.postMessage(s, '*');
+    window.postMessage(s, '*');
   }, wrapped);
 
   // Wait for "done" and collect echoToOE messages
@@ -312,7 +308,7 @@ async function exportDocument(page, format, timeoutMs = 120000) {
   const startLen = await page.evaluate(() => window.__msgQueue.length);
 
   await page.evaluate((s) => {
-    document.getElementById('pe').contentWindow.postMessage(s, '*');
+    window.postMessage(s, '*');
   }, `app.activeDocument.saveToOE("${format}");`);
 
   // Wait for ArrayBuffer followed by "done"
