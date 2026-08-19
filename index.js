@@ -410,12 +410,6 @@ function replaceText(layer, text) {
   const h = (layer.bottom || 0) - (layer.top || 0);
   if (w <= 0 || h <= 0) return null;
 
-  const canvas = createCanvas(w, h);
-  const ctx = canvas.getContext('2d');
-
-  // Extract text style from the PSD's text data. ag-psd stores text style
-  // data in layer.text.style (array of style runs). Try multiple access paths
-  // since the structure can vary between PSD versions.
   const t = layer.text || {};
   const style = t.style?.[0] || t.style || {};
   const paraStyle = t.paragraphStyle?.[0] || t.paragraphStyle || {};
@@ -437,44 +431,54 @@ function replaceText(layer, text) {
   const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || t.fillColor?.[0]?.rgb || t.fillColor?.rgb || { r: 0, g: 0, b: 0 };
   const alignment = paraStyle.alignment || style.alignment || t.alignment || 'left';
 
-  // Build font string. Use the registered alias directly — @napi-rs/canvas
-  // resolves registered family names in ctx.font.
+  // @napi-rs/canvas has a quirk where fillText silently fails on small canvases
+  // with large fonts. Workaround: render on a padded canvas, then crop.
+  const pad = Math.ceil(fontSize * 0.5);
+  const bigCanvas = createCanvas(w + pad * 2, h + pad * 2);
+  const bigCtx = bigCanvas.getContext('2d');
+
   const fontStr = `${bold ? 'bold ' : ''}${fontSize}px ${fontName}, Arial, sans-serif`;
-  ctx.font = fontStr;
-  ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
-  ctx.textBaseline = 'top';
-  ctx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
+  bigCtx.font = fontStr;
+  bigCtx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
+  bigCtx.textBaseline = 'top';
+  bigCtx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
 
   // Measure text to verify font is loaded (width=0 means font not found)
-  const metrics = ctx.measureText(text);
+  const metrics = bigCtx.measureText(text);
 
   // Multi-line text with vertical centering
   const lines = text.split('\n');
   const lineHeight = fontSize * 1.2;
   const totalHeight = lines.length * lineHeight;
-  const startY = Math.max(0, (h - totalHeight) / 2);
-  const x = alignment === 'center' ? w / 2 : alignment === 'right' ? w : 0;
-
-  // Draw a small test rect to verify the canvas context works at all
-  ctx.fillStyle = 'red';
-  ctx.fillRect(0, 0, 10, 10);
-  const testRectPx = ctx.getImageData(5, 5, 1, 1).data;
-
-  // Reset fill style for text
-  ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
+  const startY = pad + Math.max(0, (h - totalHeight) / 2);
+  const x = alignment === 'center' ? pad + w / 2 : alignment === 'right' ? pad + w : pad;
 
   lines.forEach((line, i) => {
-    ctx.fillText(line, x, startY + i * lineHeight);
+    bigCtx.fillText(line, x, startY + i * lineHeight);
   });
+
+  // Crop to layer size
+  const canvas = createCanvas(w, h);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bigCanvas, pad, pad, w, h, 0, 0, w, h);
 
   layer.canvas = canvas;
 
-  // Sample a grid of pixels to verify text was drawn
+  // Sample pixels from the cropped canvas
   const samples = {};
   for (const [sy, syLabel] of [[0, 'top'], [Math.floor(h / 2), 'mid'], [h - 1, 'bot']]) {
     for (const [sx, sxLabel] of [[0, 'L'], [Math.floor(w / 4), 'CL'], [Math.floor(w / 2), 'C'], [Math.floor(w * 3 / 4), 'CR'], [w - 1, 'R']]) {
       const px = ctx.getImageData(sx, sy, 1, 1).data;
       samples[`${syLabel}_${sxLabel}`] = [px[0], px[1], px[2], px[3]];
+    }
+  }
+  // Sample from the big canvas (at the same relative positions) to check
+  // whether text was drawn there but lost during cropping
+  const bigSamples = {};
+  for (const [sy, syLabel] of [[pad, 'top'], [pad + Math.floor(h / 2), 'mid']]) {
+    for (const [sx, sxLabel] of [[pad, 'L'], [pad + Math.floor(w / 2), 'C']]) {
+      const px = bigCtx.getImageData(sx, sy, 1, 1).data;
+      bigSamples[`${syLabel}_${sxLabel}`] = [px[0], px[1], px[2], px[3]];
     }
   }
   return {
@@ -487,7 +491,7 @@ function replaceText(layer, text) {
     registered_families: GlobalFonts.families.length,
     family_names: GlobalFonts.families.map(f => f.family),
     pixel_grid: samples,
-    test_rect_pixel: [testRectPx[0], testRectPx[1], testRectPx[2], testRectPx[3]],
+    big_canvas_grid: bigSamples,
   };
 }
 
