@@ -1,17 +1,23 @@
 /**
  * PSD Render Service (ag-psd)
  *
- * Simple server-side PSD rendering:
- * - TEXT layers: modify the text string in the PSD data, re-parse so ag-psd
- *   renders it with the layer's own font/style settings. No font extraction
- *   or manual fillText needed.
+ * Architecture: Base44 → this API → rendered PNG/JPEG
+ *
+ * - TEXT layers: manually render the child's name onto the text layer's canvas
+ *   using @napi-rs/canvas (ag-psd uses pre-rasterized pixels, not text data).
  * - ARTWORK layers (smart objects / pixel layers): replace the layer's canvas
- *   with the child's artwork image, using 'multiply' blend mode so white
- *   scan backgrounds become transparent.
+ *   with the child's artwork image, using 'multiply' blend mode so white scan
+ *   backgrounds become transparent.
+ * - COMPOSITE: re-write the modified PSD and re-read with composite: true so
+ *   ag-psd's built-in compositor handles blend modes, layer masks, clipping
+ *   masks, opacity, and effects. Falls back to a manual compositor if that
+ *   fails.
  *
  * API:
  *   POST /render  → 202 { job_id }
- *   GET  /status/:job_id → { status, result(base64), error, contentType }
+ *   GET  /status/:job_id → { status, result(base64), error, contentType, layers, matchLog, compositeMethod }
+ *   POST /layers → { width, height, layers[] }  (inspection only)
+ *   GET  /test-text → diagnostic: which fillText configs produce pixels
  */
 const express = require('express');
 const { readPsd, writePsd, initializeCanvas } = require('ag-psd');
@@ -114,6 +120,35 @@ app.get('/status/:jobId', (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, engine: 'ag-psd' }));
 
+// Diagnostic: test which fillText/strokeText configurations actually produce pixels
+app.get('/test-text', (req, res) => {
+  const tests = [];
+  const variants = [
+    { label: 'fill_red_Arial', fill: 'red', font: '30px Arial', method: 'fill' },
+    { label: 'fill_black_Arial', fill: 'black', font: '30px Arial', method: 'fill' },
+    { label: 'fill_hex_Arial', fill: '#000000', font: '30px Arial', method: 'fill' },
+    { label: 'fill_black_DejaVu', fill: 'black', font: '30px "DejaVu Sans"', method: 'fill' },
+    { label: 'fill_black_sans', fill: 'black', font: '30px sans-serif', method: 'fill' },
+    { label: 'stroke_black_Arial', stroke: 'black', font: '30px Arial', method: 'stroke' },
+    { label: 'fill_black_Arial_quoted', fill: 'black', font: '30px "Arial"', method: 'fill' },
+  ];
+  for (const v of variants) {
+    const c = createCanvas(200, 80);
+    const cx = c.getContext('2d');
+    cx.font = v.font;
+    cx.textBaseline = 'top';
+    if (v.method === 'stroke') { cx.strokeStyle = v.stroke; cx.strokeText('Hello', 10, 20); }
+    else { cx.fillStyle = v.fill; cx.fillText('Hello', 10, 20); }
+    const px = cx.getImageData(10, 20, 1, 1).data;
+    // Scan a wider area
+    let foundNonZero = false;
+    const data = cx.getImageData(0, 0, 200, 80).data;
+    for (let i = 3; i < data.length; i += 4) { if (data[i] > 0) { foundNonZero = true; break; } }
+    tests.push({ label: v.label, sample_pixel: [px[0], px[1], px[2], px[3]], has_any_pixels: foundNonZero });
+  }
+  return res.json({ families: GlobalFonts.families.map(f => f.family), tests });
+});
+
 // Diagnostic endpoint: list all layer names in a PSD
 app.post('/layers', async (req, res) => {
   try {
@@ -191,40 +226,25 @@ async function processRender(jobId, params) {
 
   // 2. Parse PSD
   console.log(`[${jobId}] parsing PSD…`);
-  let psd = readPsd(psdBuffer);
+  const psd = readPsd(psdBuffer);
   console.log(`[${jobId}] parsed: ${psd.width}×${psd.height}, ${replacements.length} replacement(s)`);
 
   const textReps = replacements.filter(r => r.type === 'text');
-  const artworkReps = replacements.filter(r => r.type === 'artwork');
+  const artworkReps = replacements.filter(r => r.type === 'artwork' || r.type === 'smart_object');
 
-  // 3. TEXT: modify the text string in each text layer's data, then re-parse
-  //    so ag-psd re-renders the text with the layer's own font/style settings.
-  //    No font extraction or manual fillText — just change the text string.
+  // 3. TEXT: manually render the child's name onto each text layer's canvas.
+  //    ag-psd uses pre-rasterized image data from the PSD (not text data), so
+  //    modifying layer.text.text doesn't change the visible canvas. We render
+  //    the text ourselves using @napi-rs/canvas.
   const matchLog = [];
-  if (textReps.length > 0) {
-    let textModified = false;
-    for (const rep of textReps) {
-      const layer = findLayerByName(psd.children || [], rep.layer_name);
-      if (layer && layer.text) {
-        const oldText = layer.text.text;
-        layer.text.text = rep.text;
-        textModified = true;
-        matchLog.push({ rep: rep.layer_name, status: 'text_modified', old: oldText, new: rep.text });
-      } else {
-        matchLog.push({ rep: rep.layer_name, status: 'text_layer_not_found' });
-      }
+  for (const rep of textReps) {
+    const layer = findLayerByName(psd.children || [], rep.layer_name);
+    if (!layer) {
+      matchLog.push({ rep: rep.layer_name, status: 'text_layer_not_found' });
+      continue;
     }
-    if (textModified) {
-      console.log(`[${jobId}] ${textReps.length} text layer(s) modified, re-parsing…`);
-      // Write modified PSD → re-read to get fresh canvases with updated text.
-      // ag-psd renders text during readPsd(), so the re-read gives us
-      // canvases with the new text content.
-      // Force 8-bit channels — writePsd doesn't support 16/32-bit, and
-      // canvases from @napi-rs/canvas are always 8-bit anyway.
-      psd.bitsPerChannel = 8;
-      const modifiedBuffer = writePsd(psd);
-      psd = readPsd(modifiedBuffer);
-    }
+    const info = replaceText(layer, rep.text);
+    matchLog.push({ rep: rep.layer_name, status: info ? 'text_rendered' : 'text_failed', ...info });
   }
 
   // 4. ARTWORK: pre-load images, then replace each artwork layer's canvas
@@ -251,31 +271,30 @@ async function processRender(jobId, params) {
     matchLog.push({ rep: rep.layer_name, status: 'artwork_replaced', img_dims: { w: img.width, h: img.height }, ...info });
   }
 
-  // 5. Composite all layers to one canvas
-  const composite = createCanvas(psd.width, psd.height);
-  const ctx = composite.getContext('2d');
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, psd.width, psd.height);
-
-  function drawLayers(layers) {
-    if (!layers || layers.length === 0) return;
-    for (const layer of layers) {
-      if (layer.hidden) continue;
-      // Group layer: draw children, skip group's own pre-rendered canvas
-      if (layer.children) { drawLayers(layer.children); continue; }
-
-      if (layer.canvas) {
-        ctx.save();
-        const op = typeof layer.opacity === 'number' ? layer.opacity : 255;
-        ctx.globalAlpha = op <= 1 ? op : op / 255;
-        const mode = BLEND_MODES[layer.blendMode];
-        if (mode) ctx.globalCompositeOperation = mode;
-        ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
-        ctx.restore();
-      }
+  // 5. Composite using ag-psd's built-in renderer
+  //    Re-write the modified PSD and re-read with composite: true so ag-psd's
+  //    internal compositor handles blend modes, layer masks, clipping masks,
+  //    opacity, and effects — not our limited custom compositor.
+  let composite;
+  let compositeMethod = 'ag-psd';
+  try {
+    psd.bitsPerChannel = 8;
+    const modifiedBuffer = writePsd(psd);
+    const reRead = readPsd(modifiedBuffer, { composite: true });
+    if (reRead.composite) {
+      composite = reRead.composite;
+    } else {
+      throw new Error('ag-psd did not generate a composite canvas');
     }
+  } catch (e) {
+    console.warn(`[${jobId}] ag-psd composite failed, falling back to manual: ${e.message}`);
+    compositeMethod = 'manual_fallback';
+    composite = createCanvas(psd.width, psd.height);
+    const ctx = composite.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, psd.width, psd.height);
+    drawLayersManual(ctx, psd.children || []);
   }
-  drawLayers(psd.children || []);
 
   // Log layer names + match results
   const allLayerNames = [];
@@ -297,14 +316,23 @@ async function processRender(jobId, params) {
   console.log(`[${jobId}] layers: ${JSON.stringify(allLayerNames)}`);
   console.log(`[${jobId}] match log: ${JSON.stringify(matchLog)}`);
 
-  // 6. Export
+  // 6. Export — flatten onto white for JPG (ag-psd composite is RGBA)
+  let exportCanvas = composite;
+  if (output_format !== 'png') {
+    exportCanvas = createCanvas(psd.width, psd.height);
+    const ectx = exportCanvas.getContext('2d');
+    ectx.fillStyle = '#ffffff';
+    ectx.fillRect(0, 0, psd.width, psd.height);
+    ectx.drawImage(composite, 0, 0);
+  }
+
   const outBuffer = output_format === 'png'
-    ? composite.toBuffer('image/png')
-    : composite.toBuffer('image/jpeg', 85);
+    ? exportCanvas.toBuffer('image/png')
+    : exportCanvas.toBuffer('image/jpeg', 85);
 
   const b64 = outBuffer.toString('base64');
-  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, startedAt: jobs.get(jobId).startedAt });
-  console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64)`);
+  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, compositeMethod, startedAt: jobs.get(jobId).startedAt });
+  console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64, ${compositeMethod})`);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -318,6 +346,68 @@ function findLayerByName(layers, name) {
     }
   }
   return null;
+}
+
+// Fallback compositor — only used if ag-psd's built-in composite fails
+function drawLayersManual(ctx, layers) {
+  if (!layers || layers.length === 0) return;
+  for (const layer of layers) {
+    if (layer.hidden) continue;
+    if (layer.children) { drawLayersManual(ctx, layer.children); continue; }
+    if (layer.canvas) {
+      ctx.save();
+      const op = typeof layer.opacity === 'number' ? layer.opacity : 255;
+      ctx.globalAlpha = op <= 1 ? op : op / 255;
+      const mode = BLEND_MODES[layer.blendMode];
+      if (mode) ctx.globalCompositeOperation = mode;
+      ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+      ctx.restore();
+    }
+  }
+}
+
+function replaceText(layer, text) {
+  const w = (layer.right || 0) - (layer.left || 0);
+  const h = (layer.bottom || 0) - (layer.top || 0);
+  if (w <= 0 || h <= 0) return null;
+
+  // Extract font size from the PSD text data (don't worry about font family —
+  // just use Arial/DejaVu Sans which we've registered). The PSD's transform
+  // matrix scales the text from internal size to layer space.
+  const t = layer.text || {};
+  const style = t.style?.[0] || t.style || {};
+  const transform = t.transform || [];
+  const transformScale = transform[0] || transform[3] || 1;
+  const baseFontSize = style.fontSize || t.fontSize || 24;
+  const fontSize = Math.round(baseFontSize * transformScale);
+  const paraStyle = t.paragraphStyle?.[0] || t.paragraphStyle || {};
+  const alignment = paraStyle.alignment || style.alignment || t.alignment || 'left';
+  const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || t.fillColor?.[0]?.rgb || t.fillColor?.rgb || { r: 0, g: 0, b: 0 };
+
+  const canvas = createCanvas(w, h);
+  const ctx = canvas.getContext('2d');
+
+  ctx.font = `${fontSize}px Arial`;
+  ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
+
+  const lines = text.split('\n');
+  const lineHeight = fontSize * 1.2;
+  const startY = h / 2 - ((lines.length - 1) * lineHeight) / 2;
+  const x = alignment === 'center' ? w / 2 : alignment === 'right' ? w : 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    ctx.fillText(lines[i], x, startY + i * lineHeight);
+  }
+
+  // Check if fillText actually produced pixels
+  const data = ctx.getImageData(0, 0, w, h).data;
+  let hasPixels = false;
+  for (let i = 3; i < data.length; i += 4) { if (data[i] > 0) { hasPixels = true; break; } }
+
+  layer.canvas = canvas;
+  return { fontSize, alignment, has_pixels: hasPixels, color: fillRGB };
 }
 
 function replaceArtwork(layer, img) {
