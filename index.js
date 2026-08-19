@@ -4,10 +4,11 @@
  * POST /render  → 202 { job_id } immediately (bypasses Railway gateway timeout)
  * GET  /status/:job_id → { status, result(base64), error, contentType }
  *
- * Uses Photopea's URL hash configuration: photopea.com#{"files":[psd],"script":...}
- * Photopea auto-loads the PSD and runs the script (replacements + saveToOE),
- * then posts the exported ArrayBuffer back to window.parent. No "done" handshake,
- * no iframe, no postMessage scripting from Node — far more reliable headless.
+ * Loads Photopea in an IFRAME (the documented OE model: Photopea posts to
+ * window.parent). The iframe src uses Photopea's URL hash config
+ * {"files":[psd],"script":...} so Photopea auto-loads the PSD and runs the
+ * replacement + saveToOE script with no "done" handshake and no postMessage
+ * scripting from Node.
  */
 const express = require('express');
 const puppeteer = require('puppeteer');
@@ -24,6 +25,7 @@ async function getBrowser() {
   if (!browser || !browser.isConnected()) {
     browser = await puppeteer.launch({
       headless: 'new',
+      protocolTimeout: 300000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -104,6 +106,7 @@ function buildReplacementScript(replacements, output_format) {
     '  nl.name = name;',
     '}',
     'walk(doc.layers);',
+    'app.echoToOE("script_done");',
     'app.activeDocument.saveToOE(' + JSON.stringify(output_format) + ');'
   ].join('\n');
 }
@@ -124,31 +127,40 @@ async function processRender(jobId, params) {
     // Build Photopea URL: load PSD + run replacement script + export via saveToOE.
     const script = buildReplacementScript(replacements, output_format);
     const config = { files: [psd_url], script };
-    const url = 'https://www.photopea.com#' + encodeURIComponent(JSON.stringify(config));
+    const photopeaUrl = 'https://www.photopea.com#' + encodeURIComponent(JSON.stringify(config));
 
-    console.log(`[${jobId}] navigating to photopea.com with config (${replacements.length} replacement(s))`);
-    await page.goto(url, { waitUntil: 'load', timeout: 90000 });
+    // Load a blank shell, then create a Photopea iframe. Photopea posts its
+    // echoToOE strings + saveToOE ArrayBuffer to window.parent (this shell),
+    // where the listener below captures them.
+    await page.setContent('<!DOCTYPE html><html><body style="margin:0"></body></html>', { waitUntil: 'load' });
+    console.log(`[${jobId}] creating Photopea iframe (${replacements.length} replacement(s))`);
 
-    // Photopea loads the PSD, runs the script, and saveToOE posts the exported
-    // ArrayBuffer to window.parent (=== window here). Capture + base64 it.
-    const b64 = await page.evaluate(async () => {
+    const b64 = await page.evaluate(async (cfgUrl) => {
+      const iframe = document.createElement('iframe');
+      iframe.src = cfgUrl;
+      iframe.style.cssText = 'width:100%;height:100vh;border:0;';
+      document.body.appendChild(iframe);
+
+      const messages = [];
       return await new Promise((resolve, reject) => {
         const to = setTimeout(() => {
           cleanup();
-          reject(new Error('Export timeout — no ArrayBuffer received from Photopea'));
-        }, 180000);
+          reject(new Error('Export timeout — no ArrayBuffer. Messages: ' + messages.slice(-30).join(' | ')));
+        }, 240000);
         const h = (e) => {
           if (e.data instanceof ArrayBuffer) {
             cleanup();
             const fr = new FileReader();
             fr.onload = () => resolve(String(fr.result).split(',')[1]);
             fr.readAsDataURL(new Blob([e.data]));
+          } else if (typeof e.data === 'string') {
+            messages.push(e.data);
           }
         };
         const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
         window.addEventListener('message', h);
       });
-    });
+    }, photopeaUrl);
 
     if (!b64) throw new Error('No output returned from Photopea');
 
