@@ -1,14 +1,14 @@
 {
   "name": "photopea-render-service",
-  "version": "2.0.0",
-  "description": "PSD render service using ag-psd for server-side smart-object and text-layer replacement — no browser required.",
+  "version": "3.0.0",
+  "description": "PSD render service using headless Chrome + Photopea for native smart-object replacement and text-layer editing.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@napi-rs/canvas": "^0.1.65",
     "ag-psd": "^30.2.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "puppeteer": "^22.15.0"
   }
 }
