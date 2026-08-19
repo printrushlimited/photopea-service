@@ -120,16 +120,25 @@ async function processRender(jobId, params) {
     }
   }
 
-  // 4. Walk layers (bottom-to-top), apply replacements, composite to one canvas
+  // 4. Walk layers (bottom-to-top), apply replacements, composite to one canvas.
+  //    PSD stores layers top-to-bottom (first child = topmost), but canvas
+  //    compositing draws later operations on top — so iterate in REVERSE
+  //    (bottommost layer first, topmost last).
   const composite = createCanvas(psd.width, psd.height);
   const ctx = composite.getContext('2d');
 
+  // JPEG doesn't support transparency — fill with white so empty areas don't
+  // render as black.
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, psd.width, psd.height);
+
   let applied = 0;
   function drawLayers(layers) {
-    if (!layers) return;
-    for (const layer of layers) {
+    if (!layers || layers.length === 0) return;
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const layer = layers[i];
       if (layer.hidden) continue;
-      // Children are below the parent — draw them first
+      // Children are within the group — draw them first (also in reverse)
       if (layer.children) drawLayers(layer.children);
 
       // Apply replacements by matching layer name
@@ -151,7 +160,10 @@ async function processRender(jobId, params) {
       // Draw this layer's canvas onto the composite
       if (layer.canvas) {
         ctx.save();
-        ctx.globalAlpha = (layer.opacity ?? 255) / 255;
+        // ag-psd stores opacity as 0-255 (matching PSD format); handle
+        // the 0-1 case defensively in case a future version normalizes.
+        const op = typeof layer.opacity === 'number' ? layer.opacity : 255;
+        ctx.globalAlpha = op <= 1 ? op : op / 255;
         const mode = BLEND_MODES[layer.blendMode];
         if (mode) ctx.globalCompositeOperation = mode;
         ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
