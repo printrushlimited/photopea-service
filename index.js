@@ -21,8 +21,9 @@ const { readPsd, initializeCanvas } = require('ag-psd');
 const { createCanvas, loadImage } = require('@napi-rs/canvas');
 const crypto = require('crypto');
 
-// ag-psd v30+ requires canvas initialization before parsing
-initializeCanvas({ createCanvas, loadImage });
+// ag-psd v30+ requires canvas initialization before parsing.
+// Pass the createCanvas function directly (not an object).
+initializeCanvas(createCanvas);
 
 const app = express();
 app.use(express.json({ limit: '256mb' }));
