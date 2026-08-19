@@ -1,16 +1,16 @@
 /**
- * Photopea render service (async job pattern, direct navigation).
+ * Photopea render service (async job pattern, URL-hash config).
  *
  * POST /render  → 202 { job_id } immediately (bypasses Railway gateway timeout)
  * GET  /status/:job_id → { status, result(base64), error, contentType }
  *
- * The render navigates headless Chrome DIRECTLY to photopea.com (no iframe),
- * which is more reliable than embedding — Photopea's WASM editor initializes
- * properly as the top page and posts its "done" ready signal.
+ * Uses Photopea's URL hash configuration: photopea.com#{"files":[psd],"script":...}
+ * Photopea auto-loads the PSD and runs the script (replacements + saveToOE),
+ * then posts the exported ArrayBuffer back to window.parent. No "done" handshake,
+ * no iframe, no postMessage scripting from Node — far more reliable headless.
  */
 const express = require('express');
 const puppeteer = require('puppeteer');
-const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
@@ -18,8 +18,6 @@ app.use(express.json({ limit: '256mb' }));
 
 const PORT = process.env.PORT || 3000;
 const JOB_TTL_MS = 10 * 60 * 1000;
-
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'page.html')));
 
 let browser;
 async function getBrowser() {
@@ -66,61 +64,9 @@ app.get('/status/:jobId', (req, res) => {
   return res.json(job);
 });
 
-const RENDER_FN = async (params) => {
-  const { psd_url, output_format, replacements } = params;
-  const win = window;
+app.get('/health', (req, res) => res.json({ ok: true }));
 
-  // Global message buffer — captures every postMessage from Photopea.
-  win.__ppSeen = new Set();
-  win.__ppMessages = [];
-  win.addEventListener('message', (e) => {
-    const key = (typeof e.data === 'string')
-      ? e.data
-      : (e.data instanceof ArrayBuffer ? '__ab__' : JSON.stringify(e.data));
-    if (!win.__ppSeen.has(key)) { win.__ppSeen.add(key); win.__ppMessages.push(key); }
-  });
-
-  const waitFor = (target, timeoutMs = 100000) => new Promise((resolve, reject) => {
-    if (win.__ppSeen.has(target)) return resolve();
-    const to = setTimeout(() => {
-      cleanup();
-      reject(new Error('Timeout waiting for: ' + target + ' | seen: ' + win.__ppMessages.slice(-16).join(', ')));
-    }, timeoutMs);
-    const h = (e) => { if (e.data === target) { cleanup(); resolve(); } };
-    const cleanup = () => { clearTimeout(to); win.removeEventListener('message', h); };
-    win.addEventListener('message', h);
-  });
-
-  // 1. Wait for Photopea ready
-  await waitFor('done');
-
-  // 2. Load the PSD
-  win.postMessage('app.open(' + JSON.stringify(psd_url) + '); app.echoToOE("psd_loaded");', '*');
-  await waitFor('psd_loaded');
-
-  // 3. Apply layer replacements
-  win.postMessage(buildReplacementScript(replacements), '*');
-  await waitFor('replaced');
-
-  // 4. Export and capture the ArrayBuffer
-  const arrayBuffer = await new Promise((resolve, reject) => {
-    const to = setTimeout(() => { cleanup(); reject(new Error('Export timeout')); }, 100000);
-    const h = (e) => { if (e.data instanceof ArrayBuffer) { cleanup(); resolve(e.data); } };
-    const cleanup = () => { clearTimeout(to); win.removeEventListener('message', h); };
-    win.addEventListener('message', h);
-    win.postMessage('app.activeDocument.saveToOE(' + JSON.stringify(output_format) + ');', '*');
-  });
-
-  // 5. base64 for transport
-  const b64 = await new Promise((resolve) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(String(fr.result).split(',')[1]);
-    fr.readAsDataURL(new Blob([arrayBuffer]));
-  });
-  return b64;
-};
-
-function buildReplacementScript(replacements) {
+function buildReplacementScript(replacements, output_format) {
   return [
     'var replacements = ' + JSON.stringify(replacements) + ';',
     'var doc = app.activeDocument;',
@@ -158,12 +104,13 @@ function buildReplacementScript(replacements) {
     '  nl.name = name;',
     '}',
     'walk(doc.layers);',
-    'app.echoToOE("replaced");'
+    'app.activeDocument.saveToOE(' + JSON.stringify(output_format) + ');'
   ].join('\n');
 }
 
 async function processRender(jobId, params) {
-  const contentType = params.output_format === 'png' ? 'image/png' : 'image/jpeg';
+  const { psd_url, output_format, replacements } = params;
+  const contentType = output_format === 'png' ? 'image/png' : 'image/jpeg';
   let page;
   try {
     jobs.set(jobId, { ...jobs.get(jobId), status: 'processing' });
@@ -174,10 +121,35 @@ async function processRender(jobId, params) {
     page.on('console', (msg) => console.log(`[${jobId}] [${msg.type()}] ${msg.text()}`));
     page.on('pageerror', (err) => console.log(`[${jobId}] [pageerror] ${err.message}`));
 
-    console.log(`[${jobId}] navigating to photopea.com`);
-    await page.goto('https://www.photopea.com', { waitUntil: 'load', timeout: 90000 });
+    // Build Photopea URL: load PSD + run replacement script + export via saveToOE.
+    const script = buildReplacementScript(replacements, output_format);
+    const config = { files: [psd_url], script };
+    const url = 'https://www.photopea.com#' + encodeURIComponent(JSON.stringify(config));
 
-    const b64 = await page.evaluate(RENDER_FN, params);
+    console.log(`[${jobId}] navigating to photopea.com with config (${replacements.length} replacement(s))`);
+    await page.goto(url, { waitUntil: 'load', timeout: 90000 });
+
+    // Photopea loads the PSD, runs the script, and saveToOE posts the exported
+    // ArrayBuffer to window.parent (=== window here). Capture + base64 it.
+    const b64 = await page.evaluate(async () => {
+      return await new Promise((resolve, reject) => {
+        const to = setTimeout(() => {
+          cleanup();
+          reject(new Error('Export timeout — no ArrayBuffer received from Photopea'));
+        }, 180000);
+        const h = (e) => {
+          if (e.data instanceof ArrayBuffer) {
+            cleanup();
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result).split(',')[1]);
+            fr.readAsDataURL(new Blob([e.data]));
+          }
+        };
+        const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
+        window.addEventListener('message', h);
+      });
+    });
+
     if (!b64) throw new Error('No output returned from Photopea');
 
     jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, startedAt: jobs.get(jobId).startedAt });
@@ -186,7 +158,6 @@ async function processRender(jobId, params) {
     console.error(`[${jobId}] render failed:`, err.message);
     let diag = err.message;
     if (page) {
-      diag += ' | seen: ' + await page.evaluate(() => (window.__ppMessages || []).slice(-20).join(', ')).catch(() => 'n/a');
       diag += ' | url: ' + await page.evaluate(() => window.location.href).catch(() => 'n/a');
     }
     jobs.set(jobId, { status: 'error', result: null, error: diag, contentType: null, startedAt: jobs.get(jobId).startedAt });
