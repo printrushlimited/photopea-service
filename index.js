@@ -437,14 +437,16 @@ function replaceText(layer, text) {
   const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || t.fillColor?.[0]?.rgb || t.fillColor?.rgb || { r: 0, g: 0, b: 0 };
   const alignment = paraStyle.alignment || style.alignment || t.alignment || 'left';
 
-  // Build font string — try the PSD font name first, fall back to Arial,
-  // then sans-serif. @napi-rs/canvas requires fonts to be registered; if the
-  // requested family isn't available, it falls back to a default.
-  const fontStr = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${fontSize}px "${fontName}", "Arial", "sans-serif"`;
+  // Build font string. Use the registered alias directly — @napi-rs/canvas
+  // resolves registered family names in ctx.font.
+  const fontStr = `${bold ? 'bold ' : ''}${fontSize}px ${fontName}, Arial, sans-serif`;
   ctx.font = fontStr;
   ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
   ctx.textBaseline = 'top';
   ctx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
+
+  // Measure text to verify font is loaded (width=0 means font not found)
+  const metrics = ctx.measureText(text);
 
   // Multi-line text with vertical centering
   const lines = text.split('\n');
@@ -459,11 +461,25 @@ function replaceText(layer, text) {
 
   layer.canvas = canvas;
 
-  // Sample multiple pixels to verify text was drawn
-  const centerPx = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
-  const topLeftPx = ctx.getImageData(2, Math.max(0, Math.floor(startY)), 1, 1).data;
-  const fontAvailable = GlobalFonts.has(fontName) || GlobalFonts.has('Arial') || (GlobalFonts.families.length > 0);
-  return { font: fontName, fontSize, bold, italic, color: fillRGB, alignment, canvas_dims: { w, h }, center_pixel: [centerPx[0], centerPx[1], centerPx[2], centerPx[3]], top_left_pixel: [topLeftPx[0], topLeftPx[1], topLeftPx[2], topLeftPx[3]], font_available: fontAvailable, registered_families: GlobalFonts.families.length };
+  // Sample a grid of pixels to verify text was drawn
+  const samples = {};
+  for (const [sy, syLabel] of [[0, 'top'], [Math.floor(h / 2), 'mid'], [h - 1, 'bot']]) {
+    for (const [sx, sxLabel] of [[0, 'L'], [Math.floor(w / 4), 'CL'], [Math.floor(w / 2), 'C'], [Math.floor(w * 3 / 4), 'CR'], [w - 1, 'R']]) {
+      const px = ctx.getImageData(sx, sy, 1, 1).data;
+      samples[`${syLabel}_${sxLabel}`] = [px[0], px[1], px[2], px[3]];
+    }
+  }
+  return {
+    font: fontName, fontSize, bold, italic, color: fillRGB, alignment,
+    canvas_dims: { w, h },
+    text_width: Math.round(metrics.width),
+    font_has_name: GlobalFonts.has(fontName),
+    font_has_arial: GlobalFonts.has('Arial'),
+    font_has_dejavu: GlobalFonts.has('DejaVu Sans'),
+    registered_families: GlobalFonts.families.length,
+    family_names: GlobalFonts.families.map(f => f.family),
+    pixel_grid: samples,
+  };
 }
 
 function replaceArtwork(layer, img) {
@@ -481,10 +497,12 @@ function replaceArtwork(layer, img) {
   ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
 
   layer.canvas = canvas;
-  // Override blend mode to 'normal' — the original blend mode (e.g. 'linear
-  // burn') was designed for the ORIGINAL artwork content, not our replacement.
-  // Keeping it would darken the artwork and hide its colors.
-  layer.blendMode = 'normal';
+  // Use 'multiply' so the white background of the child's artwork scan
+  // becomes transparent (multiply with white = no change to base), while
+  // the colored drawing content shows through. 'normal' would make the white
+  // background opaque and cover the cushion; 'linear burn' (the original PSD
+  // mode) darkens colors too aggressively.
+  layer.blendMode = 'multiply';
 
   // Sample center pixel to verify artwork was drawn
   const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
