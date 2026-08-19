@@ -219,6 +219,9 @@ async function processRender(jobId, params) {
       // Write modified PSD → re-read to get fresh canvases with updated text.
       // ag-psd renders text during readPsd(), so the re-read gives us
       // canvases with the new text content.
+      // Force 8-bit channels — writePsd doesn't support 16/32-bit, and
+      // canvases from @napi-rs/canvas are always 8-bit anyway.
+      psd.bitsPerChannel = 8;
       const modifiedBuffer = writePsd(psd);
       psd = readPsd(modifiedBuffer);
     }
