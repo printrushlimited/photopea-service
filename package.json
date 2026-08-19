@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@napi-rs/canvas": "^0.1.65",
-    "ag-psd": "^19.2.1",
+    "ag-psd": "^30.2.0",
     "express": "^4.19.2"
   }
 }
