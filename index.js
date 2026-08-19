@@ -1,37 +1,30 @@
 /**
  * PSD Render Service (ag-psd)
  *
- * Server-side PSD rendering WITHOUT a browser. Parses PSD files, replaces
- * artwork layers (smart objects / pixel layers) and text layers, then
- * composites everything to a single PNG or JPEG.
+ * Simple server-side PSD rendering:
+ * - TEXT layers: modify the text string in the PSD data, re-parse so ag-psd
+ *   renders it with the layer's own font/style settings. No font extraction
+ *   or manual fillText needed.
+ * - ARTWORK layers (smart objects / pixel layers): replace the layer's canvas
+ *   with the child's artwork image, using 'multiply' blend mode so white
+ *   scan backgrounds become transparent.
  *
- * This replaces the old Puppeteer + Photopea approach, which never worked
- * because Photopea is a WebGL/WASM app that doesn't initialize in headless
- * Chrome (it sends zero postMessages — see git history for the long saga).
- *
- * ag-psd is a pure-JS PSD parser. @napi-rs/canvas provides the canvas
- * rasterization (prebuilt, no system deps needed).
- *
- * API (unchanged from v1 — Base44 backend function needs no changes):
- *   POST /render  → 202 { job_id }            (async, bypasses gateway timeout)
+ * API:
+ *   POST /render  → 202 { job_id }
  *   GET  /status/:job_id → { status, result(base64), error, contentType }
  */
 const express = require('express');
-const { readPsd, initializeCanvas } = require('ag-psd');
+const { readPsd, writePsd, initializeCanvas } = require('ag-psd');
 const { createCanvas, loadImage, GlobalFonts } = require('@napi-rs/canvas');
 const crypto = require('crypto');
 const fs = require('fs');
 
-// ag-psd v30+ requires canvas initialization before parsing.
-// Pass the createCanvas function directly (not an object).
 initializeCanvas(createCanvas);
 
 // ── Font registration ───────────────────────────────────────────────────────
-// @napi-rs/canvas does NOT include built-in fonts. Without registering a font,
-// ctx.fillText() silently draws nothing. Try to load system fonts and register
-// common aliases (Arial, Helvetica, sans-serif) so PSD text layers render.
+// Register DejaVu Sans under common aliases so ag-psd's text rendering can
+// find a font when the PSD specifies Arial/Helvetica/sans-serif.
 try {
-  // Try loading all system fonts first (if supported by the runtime)
   if (typeof GlobalFonts.loadSystemFonts === 'function') {
     GlobalFonts.loadSystemFonts();
   }
@@ -39,80 +32,63 @@ try {
   console.warn('loadSystemFonts failed:', e.message);
 }
 
-// Register common system font paths under multiple family aliases
 const fontAliases = ['Arial', 'Helvetica', 'sans-serif'];
 const systemFontPaths = [
   '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
   '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-  '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-  '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-  '/usr/share/fonts/liberation/LiberationSans-Regular.ttf',
   '/usr/share/fonts/TTF/DejaVuSans.ttf',
   '/usr/share/fonts/dejavu/DejaVuSans.ttf',
-  '/usr/share/fonts/noto/NotoSans-Regular.ttf',
-  '/usr/share/fonts/opensans/OpenSans-Regular.ttf',
   '/System/Library/Fonts/Helvetica.ttc',
   'C:/Windows/Fonts/arial.ttf',
 ];
 
-let fontsRegistered = 0;
 for (const p of systemFontPaths) {
   if (fs.existsSync(p)) {
     for (const alias of fontAliases) {
-      try { GlobalFonts.registerFromPath(p, alias); fontsRegistered++; } catch (e) { /* ignore */ }
+      try { GlobalFonts.registerFromPath(p, alias); } catch (e) { /* ignore */ }
     }
-    try { GlobalFonts.registerFromPath(p, 'DejaVu Sans'); fontsRegistered++; } catch (e) { /* ignore */ }
-    try { GlobalFonts.registerFromPath(p, 'Liberation Sans'); fontsRegistered++; } catch (e) { /* ignore */ }
+    try { GlobalFonts.registerFromPath(p, 'DejaVu Sans'); } catch (e) { /* ignore */ }
   }
 }
-console.log(`Fonts registered: ${fontsRegistered} alias entries`);
-console.log(`Available font families: ${JSON.stringify(GlobalFonts.families.map(f => f.family))}`);
 
-// If no system fonts were found, download DejaVu Sans from a CDN and register
-// it under common aliases. Without this, ctx.fillText() draws nothing.
+// Fallback: download DejaVu Sans from CDN if no system fonts found
 async function ensureFontsAvailable() {
   if (GlobalFonts.families.length > 0) return;
-  console.log('No system fonts found — downloading fallback fonts…');
-  // Multiple sources in case one fails. Roboto from Google's official fonts
-  // repo (OFL) is reliable and has full Latin coverage.
   const fontSources = [
-    { url: 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf', path: '/tmp/DejaVuSans.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'DejaVu Sans'] },
-    { url: 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf', path: '/tmp/DejaVuSans-Bold.ttf', aliases: ['Arial Bold', 'DejaVu Sans Bold'] },
+    { url: 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'DejaVu Sans'] },
+    { url: 'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf', aliases: ['Arial Bold', 'DejaVu Sans Bold'] },
   ];
   for (const f of fontSources) {
     try {
-      console.log(`Downloading font: ${f.url}`);
       const res = await fetch(f.url, { redirect: 'follow' });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length < 1000) throw new Error(`File too small (${buf.length} bytes — likely 404 page)`);
-      fs.writeFileSync(f.path, buf);
+      if (buf.length < 1000) throw new Error('File too small');
+      const tmpPath = `/tmp/${f.url.split('/').pop()}`;
+      fs.writeFileSync(tmpPath, buf);
       for (const alias of f.aliases) {
-        try { GlobalFonts.registerFromPath(f.path, alias); } catch (e) { console.warn(`Register alias "${alias}" failed: ${e.message}`); }
+        try { GlobalFonts.registerFromPath(tmpPath, alias); } catch (e) { /* ignore */ }
       }
-      console.log(`Registered ${f.path} (${buf.length} bytes) as: ${f.aliases.join(', ')}`);
     } catch (e) {
-      console.warn(`Failed to download font from ${f.url}: ${e.message}`);
+      console.warn(`Font download failed (${f.url}): ${e.message}`);
     }
   }
-  console.log(`After download: ${GlobalFonts.families.length} font families`);
+  console.log(`Fonts after download: ${GlobalFonts.families.length} families`);
 }
 
+// ── App setup ────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '256mb' }));
 
 const PORT = process.env.PORT || 8080;
 const JOB_TTL_MS = 10 * 60 * 1000;
-
 const jobs = new Map();
 setInterval(() => {
   const cutoff = Date.now() - JOB_TTL_MS;
   for (const [id, j] of jobs) if (j.startedAt < cutoff) jobs.delete(id);
 }, 60 * 1000).unref?.();
 
-function newJobId() {
-  return crypto.randomBytes(9).toString('base64url');
-}
+function newJobId() { return crypto.randomBytes(9).toString('base64url'); }
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -138,8 +114,7 @@ app.get('/status/:jobId', (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, engine: 'ag-psd' }));
 
-// Diagnostic: list all layer names in a PSD (case-sensitive) so admins can
-// verify their layer mappings match exactly.
+// Diagnostic endpoint: list all layer names in a PSD
 app.post('/layers', async (req, res) => {
   try {
     const { psd_url } = req.body || {};
@@ -214,34 +189,92 @@ async function processRender(jobId, params) {
   const psdBuffer = Buffer.from(await psdRes.arrayBuffer());
   console.log(`[${jobId}] PSD downloaded (${(psdBuffer.length / 1024 / 1024).toFixed(1)} MB)`);
 
-  // 2. Parse with canvas support (creates canvases for ALL layers — backgrounds,
-  //    decorative layers, etc. — so we can composite the full PSD)
+  // 2. Parse PSD
   console.log(`[${jobId}] parsing PSD…`);
-  const psd = readPsd(psdBuffer);
+  let psd = readPsd(psdBuffer);
   console.log(`[${jobId}] parsed: ${psd.width}×${psd.height}, ${replacements.length} replacement(s)`);
 
-  // 3. Pre-load all artwork images
+  const textReps = replacements.filter(r => r.type === 'text');
+  const artworkReps = replacements.filter(r => r.type === 'artwork');
+
+  // 3. TEXT: modify the text string in each text layer's data, then re-parse
+  //    so ag-psd re-renders the text with the layer's own font/style settings.
+  //    No font extraction or manual fillText — just change the text string.
+  const matchLog = [];
+  if (textReps.length > 0) {
+    let textModified = false;
+    for (const rep of textReps) {
+      const layer = findLayerByName(psd.children || [], rep.layer_name);
+      if (layer && layer.text) {
+        const oldText = layer.text.text;
+        layer.text.text = rep.text;
+        textModified = true;
+        matchLog.push({ rep: rep.layer_name, status: 'text_modified', old: oldText, new: rep.text });
+      } else {
+        matchLog.push({ rep: rep.layer_name, status: 'text_layer_not_found' });
+      }
+    }
+    if (textModified) {
+      console.log(`[${jobId}] ${textReps.length} text layer(s) modified, re-parsing…`);
+      // Write modified PSD → re-read to get fresh canvases with updated text.
+      // ag-psd renders text during readPsd(), so the re-read gives us
+      // canvases with the new text content.
+      const modifiedBuffer = writePsd(psd);
+      psd = readPsd(modifiedBuffer);
+    }
+  }
+
+  // 4. ARTWORK: pre-load images, then replace each artwork layer's canvas
   const artworkCache = new Map();
-  for (const rep of replacements) {
-    if (rep.type === 'artwork' && rep.image_url && !artworkCache.has(rep.image_url)) {
+  for (const rep of artworkReps) {
+    if (rep.image_url && !artworkCache.has(rep.image_url)) {
       console.log(`[${jobId}] loading artwork: ${rep.image_url.substring(0, 80)}…`);
       artworkCache.set(rep.image_url, await loadImageFromUrl(rep.image_url));
     }
   }
 
-  // 4. Walk layers (bottom-to-top), apply replacements, composite to one canvas.
-  //    ag-psd stores children in PSD file order: first child = bottommost layer.
-  //    Canvas compositing draws later operations on top, so iterate FORWARD
-  //    (bottommost first, topmost last) to match the visual layer order.
+  for (const rep of artworkReps) {
+    const layer = findLayerByName(psd.children || [], rep.layer_name);
+    if (!layer) {
+      matchLog.push({ rep: rep.layer_name, status: 'artwork_layer_not_found' });
+      continue;
+    }
+    const img = artworkCache.get(rep.image_url);
+    if (!img) {
+      matchLog.push({ rep: rep.layer_name, status: 'no_artwork_image' });
+      continue;
+    }
+    const info = replaceArtwork(layer, img);
+    matchLog.push({ rep: rep.layer_name, status: 'artwork_replaced', img_dims: { w: img.width, h: img.height }, ...info });
+  }
+
+  // 5. Composite all layers to one canvas
   const composite = createCanvas(psd.width, psd.height);
   const ctx = composite.getContext('2d');
-
-  // JPEG doesn't support transparency — fill with white so empty areas don't
-  // render as black.
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, psd.width, psd.height);
 
-  // Collect all layer names for diagnostics
+  function drawLayers(layers) {
+    if (!layers || layers.length === 0) return;
+    for (const layer of layers) {
+      if (layer.hidden) continue;
+      // Group layer: draw children, skip group's own pre-rendered canvas
+      if (layer.children) { drawLayers(layer.children); continue; }
+
+      if (layer.canvas) {
+        ctx.save();
+        const op = typeof layer.opacity === 'number' ? layer.opacity : 255;
+        ctx.globalAlpha = op <= 1 ? op : op / 255;
+        const mode = BLEND_MODES[layer.blendMode];
+        if (mode) ctx.globalCompositeOperation = mode;
+        ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+        ctx.restore();
+      }
+    }
+  }
+  drawLayers(psd.children || []);
+
+  // Log layer names + match results
   const allLayerNames = [];
   function collectNames(layers) {
     if (!layers) return;
@@ -252,147 +285,26 @@ async function processRender(jobId, params) {
   }
   collectNames(psd.children || []);
 
-  let applied = 0;
-  const matchLog = [];
-  function drawLayers(layers) {
-    if (!layers || layers.length === 0) return;
-    for (let i = 0; i < layers.length; i++) {
-      const layer = layers[i];
-      if (layer.hidden) continue;
-      // Group layer: draw children and SKIP the group's own pre-rendered
-      // canvas. ag-psd composites group canvases at parse time — they contain
-      // stale pre-replacement artwork AND would double-composite every child
-      // (doubling shadows, darkening the whole image).
-      if (layer.children) { drawLayers(layer.children); continue; }
-
-      // Apply replacements by matching layer name
-      for (const rep of replacements) {
-        if (layer.name !== rep.layer_name) continue;
-        const w = (layer.right || 0) - (layer.left || 0);
-        const h = (layer.bottom || 0) - (layer.top || 0);
-        const diag = { rep: rep.layer_name, layer_bounds: { w, h, left: layer.left, top: layer.top }, had_canvas_before: !!layer.canvas };
-        try {
-          if (rep.type === 'text') {
-            if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
-            const tInfo = replaceText(layer, rep.text);
-            applied++;
-            matchLog.push({ ...diag, status: 'applied_text', text: rep.text, style: tInfo, blend: layer.blendMode, clipping: !!layer.clipping, raw_text_keys: Object.keys(layer.text || {}), raw_text_data: JSON.stringify(layer.text || null).substring(0, 500) });
-          } else if (rep.type === 'artwork') {
-            const img = artworkCache.get(rep.image_url);
-            if (!img) { matchLog.push({ ...diag, status: 'no_artwork_image' }); continue; }
-            if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
-            const aInfo = replaceArtwork(layer, img);
-            applied++;
-            matchLog.push({ ...diag, status: 'applied_artwork', img_dims: { w: img.width, h: img.height }, scale: aInfo?.scale, draw_dims: aInfo?.draw_dims, center_pixel: aInfo?.center_pixel, blend: layer.blendMode, clipping: !!layer.clipping });
-          }
-        } catch (e) {
-          matchLog.push({ ...diag, status: 'error', error: e.message });
-          console.error(`[${jobId}] replace "${layer.name}": ${e.message}`);
-        }
-      }
-
-      // Draw this layer's canvas onto the composite
-      if (layer.canvas) {
-        ctx.save();
-        // ag-psd stores opacity as 0-255 (matching PSD format); handle
-        // the 0-1 case defensively in case a future version normalizes.
-        const op = typeof layer.opacity === 'number' ? layer.opacity : 255;
-        ctx.globalAlpha = op <= 1 ? op : op / 255;
-        const mode = BLEND_MODES[layer.blendMode];
-        if (mode) ctx.globalCompositeOperation = mode;
-        ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
-        ctx.restore();
-      }
-    }
-  }
-
-  drawLayers(psd.children || []);
-
-  // Log unmatched replacements
   for (const rep of replacements) {
     if (!allLayerNames.includes(rep.layer_name)) {
       matchLog.push({ rep: rep.layer_name, status: 'NO_MATCH', available: allLayerNames });
     }
   }
 
-  // Post-composite diagnostic: sample a pixel at the center of each replaced
-  // layer's bounds on the FINAL composite. If the pixel is white/transparent,
-  // something above is covering the replacement.
-  const postPixels = [];
-  for (const rep of replacements) {
-    const layer = findLayerByName(psd.children || [], rep.layer_name);
-    if (!layer) continue;
-    const cx = Math.floor((layer.left || 0) + ((layer.right || 0) - (layer.left || 0)) / 2);
-    const cy = Math.floor((layer.top || 0) + ((layer.bottom || 0) - (layer.top || 0)) / 2);
-    const px = ctx.getImageData(cx, cy, 1, 1).data;
-    postPixels.push({ rep: rep.layer_name, composite_pos: { x: cx, y: cy }, pixel: [px[0], px[1], px[2], px[3]] });
-  }
-
-  // Per-layer alpha diagnostic: for each layer with a canvas, sample its OWN
-  // canvas alpha at the artwork center position (in local coordinates). This
-  // identifies which layer is opaque and covering the artwork.
-  const layerAlphaAtArtwork = [];
-  const artworkRep = replacements.find(r => r.type === 'artwork');
-  if (artworkRep) {
-    const awLayer = findLayerByName(psd.children || [], artworkRep.layer_name);
-    if (awLayer) {
-      const awCx = Math.floor((awLayer.right || 0) - (awLayer.left || 0)) / 2; // local coord
-      const awCy = Math.floor((awLayer.bottom || 0) - (awLayer.top || 0)) / 2;
-      function sampleLayerAlpha(layers, depth) {
-        if (!layers) return;
-        for (const layer of layers) {
-          if (layer.canvas && !layer.hidden) {
-            const lw = (layer.right || 0) - (layer.left || 0);
-            const lh = (layer.bottom || 0) - (layer.top || 0);
-            // Convert artwork center (composite coords) to this layer's local coords
-            const localX = Math.floor((awLayer.left || 0) + awCx - (layer.left || 0));
-            const localY = Math.floor((awLayer.top || 0) + awCy - (layer.top || 0));
-            if (localX >= 0 && localY >= 0 && localX < lw && localY < lh) {
-              try {
-                const lctx = layer.canvas.getContext('2d');
-                const px = lctx.getImageData(localX, localY, 1, 1).data;
-                layerAlphaAtArtwork.push({ name: layer.name, local_pos: { x: localX, y: localY }, pixel: [px[0], px[1], px[2], px[3]], blend: layer.blendMode || 'normal' });
-              } catch (e) { /* skip */ }
-            }
-          }
-          if (layer.children) sampleLayerAlpha(layer.children, depth + 1);
-        }
-      }
-      sampleLayerAlpha(psd.children || [], 0);
-    }
-  }
-
-  // Also log blend mode + opacity of all layers to check z-ordering
-  const layerOrder = [];
-  function logOrder(layers, depth) {
-    if (!layers) return;
-    for (const layer of layers) {
-      const w = (layer.right || 0) - (layer.left || 0);
-      const h = (layer.bottom || 0) - (layer.top || 0);
-      layerOrder.push({ name: layer.name, depth, blend: layer.blendMode || 'normal', opacity: layer.opacity, hidden: !!layer.hidden, has_canvas: !!layer.canvas, clipping: !!layer.clipping, size: w > 0 ? `${w}x${h}` : null });
-      if (layer.children) logOrder(layer.children, depth + 1);
-    }
-  }
-  logOrder(psd.children || [], 0);
-
-  console.log(`[${jobId}] layers found: ${JSON.stringify(allLayerNames)}`);
+  console.log(`[${jobId}] layers: ${JSON.stringify(allLayerNames)}`);
   console.log(`[${jobId}] match log: ${JSON.stringify(matchLog)}`);
-  console.log(`[${jobId}] post-composite pixels: ${JSON.stringify(postPixels)}`);
-  console.log(`[${jobId}] per-layer alpha at artwork pos: ${JSON.stringify(layerAlphaAtArtwork)}`);
-  console.log(`[${jobId}] layer order: ${JSON.stringify(layerOrder)}`);
-  console.log(`[${jobId}] composited (${applied}/${replacements.length} replacements applied)`);
 
-  // 5. Export to PNG or JPEG
+  // 6. Export
   const outBuffer = output_format === 'png'
     ? composite.toBuffer('image/png')
     : composite.toBuffer('image/jpeg', 85);
 
   const b64 = outBuffer.toString('base64');
-  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, postPixels, layerAlphaAtArtwork, layerOrder, startedAt: jobs.get(jobId).startedAt });
+  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, startedAt: jobs.get(jobId).startedAt });
   console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64)`);
 }
 
-// ── Layer replacement helpers ────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function findLayerByName(layers, name) {
   for (const layer of layers || []) {
@@ -403,96 +315,6 @@ function findLayerByName(layers, name) {
     }
   }
   return null;
-}
-
-function replaceText(layer, text) {
-  const w = (layer.right || 0) - (layer.left || 0);
-  const h = (layer.bottom || 0) - (layer.top || 0);
-  if (w <= 0 || h <= 0) return null;
-
-  const t = layer.text || {};
-  const style = t.style?.[0] || t.style || {};
-  const paraStyle = t.paragraphStyle?.[0] || t.paragraphStyle || {};
-
-  // PSD text layers store a transform matrix [a, b, c, d, tx, ty] that scales
-  // the text from its internal size to layer space. The style.fontSize is the
-  // UNSCALED size — we must multiply by the transform's scale factor (a or d)
-  // to get the actual rendered pixel size.
-  const transform = t.transform || [];
-  const transformScale = transform[0] || transform[3] || 1;
-  const baseFontSize = style.fontSize || t.fontSize || 24;
-  const fontSize = Math.round(baseFontSize * transformScale);
-  let fontName = style.font?.name || t.font?.name || style.fontFamily || t.fontFamily || 'Arial';
-  // Map common PostScript font names to CSS families
-  fontName = fontName.replace(/MT$|PS$|-Regular$|-Bold$|-Italic$|-BoldItalic$/g, '').replace(/-/g, ' ');
-
-  const bold = style.bold || t.bold || /bold/i.test(style.font?.name || t.font?.name || '');
-  const italic = style.italic || t.italic || /italic/i.test(style.font?.name || t.font?.name || '');
-  const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || t.fillColor?.[0]?.rgb || t.fillColor?.rgb || { r: 0, g: 0, b: 0 };
-  const alignment = paraStyle.alignment || style.alignment || t.alignment || 'left';
-
-  // @napi-rs/canvas has a quirk where fillText silently fails on small canvases
-  // with large fonts. Workaround: render on a padded canvas, then crop.
-  const pad = Math.ceil(fontSize * 0.5);
-  const bigCanvas = createCanvas(w + pad * 2, h + pad * 2);
-  const bigCtx = bigCanvas.getContext('2d');
-
-  const fontStr = `${bold ? 'bold ' : ''}${fontSize}px ${fontName}, Arial, sans-serif`;
-  bigCtx.font = fontStr;
-  bigCtx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
-  bigCtx.textBaseline = 'top';
-  bigCtx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
-
-  // Measure text to verify font is loaded (width=0 means font not found)
-  const metrics = bigCtx.measureText(text);
-
-  // Multi-line text with vertical centering
-  const lines = text.split('\n');
-  const lineHeight = fontSize * 1.2;
-  const totalHeight = lines.length * lineHeight;
-  const startY = pad + Math.max(0, (h - totalHeight) / 2);
-  const x = alignment === 'center' ? pad + w / 2 : alignment === 'right' ? pad + w : pad;
-
-  lines.forEach((line, i) => {
-    bigCtx.fillText(line, x, startY + i * lineHeight);
-  });
-
-  // Crop to layer size
-  const canvas = createCanvas(w, h);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(bigCanvas, pad, pad, w, h, 0, 0, w, h);
-
-  layer.canvas = canvas;
-
-  // Sample pixels from the cropped canvas
-  const samples = {};
-  for (const [sy, syLabel] of [[0, 'top'], [Math.floor(h / 2), 'mid'], [h - 1, 'bot']]) {
-    for (const [sx, sxLabel] of [[0, 'L'], [Math.floor(w / 4), 'CL'], [Math.floor(w / 2), 'C'], [Math.floor(w * 3 / 4), 'CR'], [w - 1, 'R']]) {
-      const px = ctx.getImageData(sx, sy, 1, 1).data;
-      samples[`${syLabel}_${sxLabel}`] = [px[0], px[1], px[2], px[3]];
-    }
-  }
-  // Sample from the big canvas (at the same relative positions) to check
-  // whether text was drawn there but lost during cropping
-  const bigSamples = {};
-  for (const [sy, syLabel] of [[pad, 'top'], [pad + Math.floor(h / 2), 'mid']]) {
-    for (const [sx, sxLabel] of [[pad, 'L'], [pad + Math.floor(w / 2), 'C']]) {
-      const px = bigCtx.getImageData(sx, sy, 1, 1).data;
-      bigSamples[`${syLabel}_${sxLabel}`] = [px[0], px[1], px[2], px[3]];
-    }
-  }
-  return {
-    font: fontName, fontSize, bold, italic, color: fillRGB, alignment,
-    canvas_dims: { w, h },
-    text_width: Math.round(metrics.width),
-    font_has_name: GlobalFonts.has(fontName),
-    font_has_arial: GlobalFonts.has('Arial'),
-    font_has_dejavu: GlobalFonts.has('DejaVu Sans'),
-    registered_families: GlobalFonts.families.length,
-    family_names: GlobalFonts.families.map(f => f.family),
-    pixel_grid: samples,
-    big_canvas_grid: bigSamples,
-  };
 }
 
 function replaceArtwork(layer, img) {
@@ -510,16 +332,10 @@ function replaceArtwork(layer, img) {
   ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
 
   layer.canvas = canvas;
-  // Use 'multiply' so the white background of the child's artwork scan
-  // becomes transparent (multiply with white = no change to base), while
-  // the colored drawing content shows through. 'normal' would make the white
-  // background opaque and cover the cushion; 'linear burn' (the original PSD
-  // mode) darkens colors too aggressively.
+  // Use 'multiply' so white scan backgrounds become transparent
   layer.blendMode = 'multiply';
 
-  // Sample center pixel to verify artwork was drawn
-  const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
-  return { scale, draw_dims: { w: dw, h: dh }, center_pixel: [px[0], px[1], px[2], px[3]] };
+  return { scale: Math.round(scale * 1000) / 1000, draw_dims: { w: dw, h: dh } };
 }
 
 ensureFontsAvailable().finally(() => {
