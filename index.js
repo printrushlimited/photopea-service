@@ -32,6 +32,8 @@ async function getBrowser() {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--enable-wasm',
+        '--disable-features=StoragePartitioning,ThirdPartyStoragePartitioning',
+        '--disable-site-isolation-trials',
       ],
     });
   }
@@ -67,6 +69,7 @@ app.get('/status/:jobId', (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/shell', (req, res) => res.send('<!DOCTYPE html><html><body style="margin:0"></body></html>'));
 
 function buildReplacementScript(replacements, output_format) {
   return [
@@ -130,7 +133,7 @@ async function processRender(jobId, params) {
     // Load a blank shell, then create a Photopea iframe (no hash config).
     // Drive Photopea via postMessage: wait for "done", open PSD, run script,
     // then saveToOE posts the ArrayBuffer to window.parent (this shell).
-    await page.setContent('<!DOCTYPE html><html><body style="margin:0"></body></html>', { waitUntil: 'load' });
+    await page.goto('http://localhost:' + PORT + '/shell', { waitUntil: 'load', timeout: 60000 });
     console.log(`[${jobId}] creating Photopea iframe (${replacements.length} replacement(s))`);
 
     const b64 = await page.evaluate(async (psdUrl, fmt, replacementScript) => {
