@@ -194,22 +194,23 @@ async function processRender(jobId, params) {
         if (layer.name !== rep.layer_name) continue;
         const w = (layer.right || 0) - (layer.left || 0);
         const h = (layer.bottom || 0) - (layer.top || 0);
+        const diag = { rep: rep.layer_name, layer_bounds: { w, h, left: layer.left, top: layer.top }, had_canvas_before: !!layer.canvas };
         try {
           if (rep.type === 'text') {
-            if (w <= 0 || h <= 0) { matchLog.push({ rep: rep.layer_name, status: 'skipped_no_bounds' }); continue; }
-            replaceText(layer, rep.text);
+            if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
+            const tInfo = replaceText(layer, rep.text);
             applied++;
-            matchLog.push({ rep: rep.layer_name, status: 'applied_text' });
+            matchLog.push({ ...diag, status: 'applied_text', text: rep.text, style: tInfo });
           } else if (rep.type === 'artwork') {
             const img = artworkCache.get(rep.image_url);
-            if (!img) { matchLog.push({ rep: rep.layer_name, status: 'no_artwork_image' }); continue; }
-            if (w <= 0 || h <= 0) { matchLog.push({ rep: rep.layer_name, status: 'skipped_no_bounds' }); continue; }
-            replaceArtwork(layer, img);
+            if (!img) { matchLog.push({ ...diag, status: 'no_artwork_image' }); continue; }
+            if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
+            const aInfo = replaceArtwork(layer, img);
             applied++;
-            matchLog.push({ rep: rep.layer_name, status: 'applied_artwork' });
+            matchLog.push({ ...diag, status: 'applied_artwork', img_dims: { w: img.width, h: img.height }, scale: aInfo?.scale });
           }
         } catch (e) {
-          matchLog.push({ rep: rep.layer_name, status: 'error', error: e.message });
+          matchLog.push({ ...diag, status: 'error', error: e.message });
           console.error(`[${jobId}] replace "${layer.name}": ${e.message}`);
         }
       }
@@ -257,7 +258,7 @@ async function processRender(jobId, params) {
 function replaceText(layer, text) {
   const w = (layer.right || 0) - (layer.left || 0);
   const h = (layer.bottom || 0) - (layer.top || 0);
-  if (w <= 0 || h <= 0) return;
+  if (w <= 0 || h <= 0) return null;
 
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext('2d');
@@ -293,12 +294,16 @@ function replaceText(layer, text) {
   });
 
   layer.canvas = canvas;
+
+  // Sample center pixel to verify text was drawn
+  const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
+  return { font: fontName, fontSize, bold, italic, color: fillRGB, alignment, canvas_dims: { w, h }, center_pixel: [px[0], px[1], px[2], px[3]] };
 }
 
 function replaceArtwork(layer, img) {
   const w = (layer.right || 0) - (layer.left || 0);
   const h = (layer.bottom || 0) - (layer.top || 0);
-  if (w <= 0 || h <= 0) return;
+  if (w <= 0 || h <= 0) return null;
 
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext('2d');
@@ -310,6 +315,10 @@ function replaceArtwork(layer, img) {
   ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
 
   layer.canvas = canvas;
+
+  // Sample center pixel to verify artwork was drawn
+  const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
+  return { scale, draw_dims: { w: dw, h: dh }, center_pixel: [px[0], px[1], px[2], px[3]] };
 }
 
 app.listen(PORT, () => console.log(`PSD render service (ag-psd) listening on :${PORT}`));
