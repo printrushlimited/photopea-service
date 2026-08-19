@@ -18,12 +18,55 @@
  */
 const express = require('express');
 const { readPsd, initializeCanvas } = require('ag-psd');
-const { createCanvas, loadImage } = require('@napi-rs/canvas');
+const { createCanvas, loadImage, GlobalFonts } = require('@napi-rs/canvas');
 const crypto = require('crypto');
+const fs = require('fs');
 
 // ag-psd v30+ requires canvas initialization before parsing.
 // Pass the createCanvas function directly (not an object).
 initializeCanvas(createCanvas);
+
+// ── Font registration ───────────────────────────────────────────────────────
+// @napi-rs/canvas does NOT include built-in fonts. Without registering a font,
+// ctx.fillText() silently draws nothing. Try to load system fonts and register
+// common aliases (Arial, Helvetica, sans-serif) so PSD text layers render.
+try {
+  // Try loading all system fonts first (if supported by the runtime)
+  if (typeof GlobalFonts.loadSystemFonts === 'function') {
+    GlobalFonts.loadSystemFonts();
+  }
+} catch (e) {
+  console.warn('loadSystemFonts failed:', e.message);
+}
+
+// Register common system font paths under multiple family aliases
+const fontAliases = ['Arial', 'Helvetica', 'sans-serif'];
+const systemFontPaths = [
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+  '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+  '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+  '/usr/share/fonts/liberation/LiberationSans-Regular.ttf',
+  '/usr/share/fonts/TTF/DejaVuSans.ttf',
+  '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+  '/usr/share/fonts/noto/NotoSans-Regular.ttf',
+  '/usr/share/fonts/opensans/OpenSans-Regular.ttf',
+  '/System/Library/Fonts/Helvetica.ttc',
+  'C:/Windows/Fonts/arial.ttf',
+];
+
+let fontsRegistered = 0;
+for (const p of systemFontPaths) {
+  if (fs.existsSync(p)) {
+    for (const alias of fontAliases) {
+      try { GlobalFonts.registerFromPath(p, alias); fontsRegistered++; } catch (e) { /* ignore */ }
+    }
+    try { GlobalFonts.registerFromPath(p, 'DejaVu Sans'); fontsRegistered++; } catch (e) { /* ignore */ }
+    try { GlobalFonts.registerFromPath(p, 'Liberation Sans'); fontsRegistered++; } catch (e) { /* ignore */ }
+  }
+}
+console.log(`Fonts registered: ${fontsRegistered} alias entries`);
+console.log(`Available font families: ${JSON.stringify(GlobalFonts.families.map(f => f.family))}`);
 
 const app = express();
 app.use(express.json({ limit: '256mb' }));
@@ -200,7 +243,7 @@ async function processRender(jobId, params) {
             if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
             const tInfo = replaceText(layer, rep.text);
             applied++;
-            matchLog.push({ ...diag, status: 'applied_text', text: rep.text, style: tInfo, blend: layer.blendMode, clipping: !!layer.clipping, raw_text_data: JSON.stringify(layer.text?.style?.[0] || null).substring(0, 200) });
+            matchLog.push({ ...diag, status: 'applied_text', text: rep.text, style: tInfo, blend: layer.blendMode, clipping: !!layer.clipping, raw_text_keys: Object.keys(layer.text || {}), raw_text_data: JSON.stringify(layer.text || null).substring(0, 500) });
           } else if (rep.type === 'artwork') {
             const img = artworkCache.get(rep.image_url);
             if (!img) { matchLog.push({ ...diag, status: 'no_artwork_image' }); continue; }
@@ -252,6 +295,40 @@ async function processRender(jobId, params) {
     postPixels.push({ rep: rep.layer_name, composite_pos: { x: cx, y: cy }, pixel: [px[0], px[1], px[2], px[3]] });
   }
 
+  // Per-layer alpha diagnostic: for each layer with a canvas, sample its OWN
+  // canvas alpha at the artwork center position (in local coordinates). This
+  // identifies which layer is opaque and covering the artwork.
+  const layerAlphaAtArtwork = [];
+  const artworkRep = replacements.find(r => r.type === 'artwork');
+  if (artworkRep) {
+    const awLayer = findLayerByName(psd.children || [], artworkRep.layer_name);
+    if (awLayer) {
+      const awCx = Math.floor((awLayer.right || 0) - (awLayer.left || 0)) / 2; // local coord
+      const awCy = Math.floor((awLayer.bottom || 0) - (awLayer.top || 0)) / 2;
+      function sampleLayerAlpha(layers, depth) {
+        if (!layers) return;
+        for (const layer of layers) {
+          if (layer.canvas && !layer.hidden) {
+            const lw = (layer.right || 0) - (layer.left || 0);
+            const lh = (layer.bottom || 0) - (layer.top || 0);
+            // Convert artwork center (composite coords) to this layer's local coords
+            const localX = Math.floor((awLayer.left || 0) + awCx - (layer.left || 0));
+            const localY = Math.floor((awLayer.top || 0) + awCy - (layer.top || 0));
+            if (localX >= 0 && localY >= 0 && localX < lw && localY < lh) {
+              try {
+                const lctx = layer.canvas.getContext('2d');
+                const px = lctx.getImageData(localX, localY, 1, 1).data;
+                layerAlphaAtArtwork.push({ name: layer.name, local_pos: { x: localX, y: localY }, pixel: [px[0], px[1], px[2], px[3]], blend: layer.blendMode || 'normal' });
+              } catch (e) { /* skip */ }
+            }
+          }
+          if (layer.children) sampleLayerAlpha(layer.children, depth + 1);
+        }
+      }
+      sampleLayerAlpha(psd.children || [], 0);
+    }
+  }
+
   // Also log blend mode + opacity of all layers to check z-ordering
   const layerOrder = [];
   function logOrder(layers, depth) {
@@ -268,6 +345,7 @@ async function processRender(jobId, params) {
   console.log(`[${jobId}] layers found: ${JSON.stringify(allLayerNames)}`);
   console.log(`[${jobId}] match log: ${JSON.stringify(matchLog)}`);
   console.log(`[${jobId}] post-composite pixels: ${JSON.stringify(postPixels)}`);
+  console.log(`[${jobId}] per-layer alpha at artwork pos: ${JSON.stringify(layerAlphaAtArtwork)}`);
   console.log(`[${jobId}] layer order: ${JSON.stringify(layerOrder)}`);
   console.log(`[${jobId}] composited (${applied}/${replacements.length} replacements applied)`);
 
@@ -277,7 +355,7 @@ async function processRender(jobId, params) {
     : composite.toBuffer('image/jpeg', 85);
 
   const b64 = outBuffer.toString('base64');
-  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, postPixels, layerOrder, startedAt: jobs.get(jobId).startedAt });
+  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, postPixels, layerAlphaAtArtwork, layerOrder, startedAt: jobs.get(jobId).startedAt });
   console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64)`);
 }
 
@@ -302,21 +380,28 @@ function replaceText(layer, text) {
   const canvas = createCanvas(w, h);
   const ctx = canvas.getContext('2d');
 
-  // Extract text style from the PSD's text data
-  const style = layer.text?.style?.[0] || {};
-  const paraStyle = layer.text?.paragraphStyle || {};
+  // Extract text style from the PSD's text data. ag-psd stores text style
+  // data in layer.text.style (array of style runs). Try multiple access paths
+  // since the structure can vary between PSD versions.
+  const t = layer.text || {};
+  const style = t.style?.[0] || t.style || {};
+  const paraStyle = t.paragraphStyle?.[0] || t.paragraphStyle || {};
 
-  const fontSize = Math.round(style.fontSize || 24);
-  let fontName = style.font?.name || 'Arial';
+  const fontSize = Math.round(style.fontSize || t.fontSize || 24);
+  let fontName = style.font?.name || t.font?.name || 'Arial';
   // Map common PostScript font names to CSS families
   fontName = fontName.replace(/MT$|PS$|-Regular$|-Bold$|-Italic$|-BoldItalic$/g, '').replace(/-/g, ' ');
 
-  const bold = style.bold || /bold/i.test(style.font?.name || '');
-  const italic = style.italic || /italic/i.test(style.font?.name || '');
-  const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || { r: 0, g: 0, b: 0 };
-  const alignment = paraStyle.alignment || style.alignment || 'left';
+  const bold = style.bold || t.bold || /bold/i.test(style.font?.name || t.font?.name || '');
+  const italic = style.italic || t.italic || /italic/i.test(style.font?.name || t.font?.name || '');
+  const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || t.fillColor?.[0]?.rgb || t.fillColor?.rgb || { r: 0, g: 0, b: 0 };
+  const alignment = paraStyle.alignment || style.alignment || t.alignment || 'left';
 
-  ctx.font = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${fontSize}px "${fontName}", Arial, sans-serif`;
+  // Build font string — try the PSD font name first, fall back to Arial,
+  // then sans-serif. @napi-rs/canvas requires fonts to be registered; if the
+  // requested family isn't available, it falls back to a default.
+  const fontStr = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${fontSize}px "${fontName}", "Arial", "sans-serif"`;
+  ctx.font = fontStr;
   ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
   ctx.textBaseline = 'top';
   ctx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
@@ -334,9 +419,11 @@ function replaceText(layer, text) {
 
   layer.canvas = canvas;
 
-  // Sample center pixel to verify text was drawn
-  const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
-  return { font: fontName, fontSize, bold, italic, color: fillRGB, alignment, canvas_dims: { w, h }, center_pixel: [px[0], px[1], px[2], px[3]], top_left_pixel: (() => { const p = ctx.getImageData(2, 2, 1, 1).data; return [p[0], p[1], p[2], p[3]]; })() };
+  // Sample multiple pixels to verify text was drawn
+  const centerPx = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
+  const topLeftPx = ctx.getImageData(2, Math.max(0, Math.floor(startY)), 1, 1).data;
+  const fontAvailable = GlobalFonts.has(fontName) || GlobalFonts.has('Arial') || (GlobalFonts.families.length > 0);
+  return { font: fontName, fontSize, bold, italic, color: fillRGB, alignment, canvas_dims: { w, h }, center_pixel: [centerPx[0], centerPx[1], centerPx[2], centerPx[3]], top_left_pixel: [topLeftPx[0], topLeftPx[1], topLeftPx[2], topLeftPx[3]], font_available: fontAvailable, registered_families: GlobalFonts.families.length };
 }
 
 function replaceArtwork(layer, img) {
