@@ -239,8 +239,36 @@ async function processRender(jobId, params) {
     }
   }
 
+  // Post-composite diagnostic: sample a pixel at the center of each replaced
+  // layer's bounds on the FINAL composite. If the pixel is white/transparent,
+  // something above is covering the replacement.
+  const postPixels = [];
+  for (const rep of replacements) {
+    const layer = findLayerByName(psd.children || [], rep.layer_name);
+    if (!layer) continue;
+    const cx = Math.floor((layer.left || 0) + ((layer.right || 0) - (layer.left || 0)) / 2);
+    const cy = Math.floor((layer.top || 0) + ((layer.bottom || 0) - (layer.top || 0)) / 2);
+    const px = ctx.getImageData(cx, cy, 1, 1).data;
+    postPixels.push({ rep: rep.layer_name, composite_pos: { x: cx, y: cy }, pixel: [px[0], px[1], px[2], px[3]] });
+  }
+
+  // Also log blend mode + opacity of all layers to check z-ordering
+  const layerOrder = [];
+  function logOrder(layers, depth) {
+    if (!layers) return;
+    for (const layer of layers) {
+      const w = (layer.right || 0) - (layer.left || 0);
+      const h = (layer.bottom || 0) - (layer.top || 0);
+      layerOrder.push({ name: layer.name, depth, blend: layer.blendMode || 'normal', opacity: layer.opacity, hidden: !!layer.hidden, has_canvas: !!layer.canvas, size: w > 0 ? `${w}x${h}` : null });
+      if (layer.children) logOrder(layer.children, depth + 1);
+    }
+  }
+  logOrder(psd.children || [], 0);
+
   console.log(`[${jobId}] layers found: ${JSON.stringify(allLayerNames)}`);
   console.log(`[${jobId}] match log: ${JSON.stringify(matchLog)}`);
+  console.log(`[${jobId}] post-composite pixels: ${JSON.stringify(postPixels)}`);
+  console.log(`[${jobId}] layer order: ${JSON.stringify(layerOrder)}`);
   console.log(`[${jobId}] composited (${applied}/${replacements.length} replacements applied)`);
 
   // 5. Export to PNG or JPEG
@@ -249,11 +277,22 @@ async function processRender(jobId, params) {
     : composite.toBuffer('image/jpeg', 85);
 
   const b64 = outBuffer.toString('base64');
-  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, startedAt: jobs.get(jobId).startedAt });
+  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, layers: allLayerNames, matchLog, postPixels, layerOrder, startedAt: jobs.get(jobId).startedAt });
   console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64)`);
 }
 
 // ── Layer replacement helpers ────────────────────────────────────────────────
+
+function findLayerByName(layers, name) {
+  for (const layer of layers || []) {
+    if (layer.name === name) return layer;
+    if (layer.children) {
+      const found = findLayerByName(layer.children, name);
+      if (found) return found;
+    }
+  }
+  return null;
+}
 
 function replaceText(layer, text) {
   const w = (layer.right || 0) - (layer.left || 0);
