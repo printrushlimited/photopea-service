@@ -17,9 +17,12 @@
  *   GET  /status/:job_id → { status, result(base64), error, contentType }
  */
 const express = require('express');
-const { readPsd } = require('ag-psd');
+const { readPsd, initializeCanvas } = require('ag-psd');
 const { createCanvas, loadImage } = require('@napi-rs/canvas');
 const crypto = require('crypto');
+
+// ag-psd v30+ requires canvas initialization before parsing
+initializeCanvas({ createCanvas, loadImage });
 
 const app = express();
 app.use(express.json({ limit: '256mb' }));
@@ -104,7 +107,7 @@ async function processRender(jobId, params) {
   // 2. Parse with canvas support (creates canvases for ALL layers — backgrounds,
   //    decorative layers, etc. — so we can composite the full PSD)
   console.log(`[${jobId}] parsing PSD…`);
-  const psd = readPsd(psdBuffer, { canvas: { createCanvas, loadImage } });
+  const psd = readPsd(psdBuffer);
   console.log(`[${jobId}] parsed: ${psd.width}×${psd.height}, ${replacements.length} replacement(s)`);
 
   // 3. Pre-load all artwork images
