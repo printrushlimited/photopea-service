@@ -109,11 +109,13 @@ async function processRender(jobId, { psd_url, output_format, replacements }) {
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--use-gl=swiftshader',
       '--disable-dev-shm-usage',
+      '--enable-unsafe-swiftshader',
+      '--use-gl=angle',
+      '--use-angle=swiftshader',
       '--disable-web-security',
       '--disable-features=IsolateOrigins,site-per-process',
+      '--allow-running-insecure-content',
     ],
   });
 
@@ -122,12 +124,18 @@ async function processRender(jobId, { psd_url, output_format, replacements }) {
     page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Set up page with Photopea iframe and message queue
+    // Capture page console and errors for debugging
+    page.on('console', msg => console.log(`[${jobId}] [page console] ${msg.type()}: ${msg.text()}`));
+    page.on('pageerror', err => console.log(`[${jobId}] [page error] ${err.message}`));
+
+    // Set up page with Photopea iframe and message queue.
+    // The <script> runs synchronously during parsing BEFORE the iframe's
+    // network request completes, so the listener is ready when Photopea loads.
     await page.setContent(`
       <!DOCTYPE html>
       <html><head><title>Photopea Render</title></head>
       <body style="margin:0;padding:0;overflow:hidden;">
-        <iframe id="pe" src="https://www.photopea.com" style="width:100%;height:100vh;border:none;"></iframe>
+        <iframe id="pe" src="https://www.photopea.com" style="width:100%;height:100vh;border:none;" allow="autoplay; camera; clipboard-read; clipboard-write"></iframe>
         <script>
           window.__msgQueue = [];
           window.addEventListener('message', function(e) {
@@ -137,15 +145,19 @@ async function processRender(jobId, { psd_url, output_format, replacements }) {
       </body></html>
     `);
 
-    // Wait for Photopea to initialize — it sends "done" when ready
+    // Wait for the iframe element to exist
+    await page.waitForSelector('#pe', { timeout: 10000 });
+
+    // Wait for Photopea to initialize — it sends "done" when ready.
+    // Photopea is a heavy web app; in a container this can take 60-120s.
     console.log(`[${jobId}] Waiting for Photopea to initialize…`);
-    await waitForMessage(page, 'done', 90000);
+    await waitForMessage(page, 'done', 180000);
     console.log(`[${jobId}] Photopea ready`);
 
     // 1. Open the PSD from URL
     console.log(`[${jobId}] Opening PSD: ${psd_url.substring(0, 80)}…`);
-    await runScript(page, `app.open("${esc(psd_url)}");`, 120000);
-    await new Promise(r => setTimeout(r, 2000));
+    await runScript(page, `app.open("${esc(psd_url)}");`, 180000);
+    await new Promise(r => setTimeout(r, 3000));
 
     const matchLog = [];
 
@@ -188,8 +200,8 @@ async function processRender(jobId, { psd_url, output_format, replacements }) {
             soDoc.selection.clear();
             app.open("${esc(rep.image_url)}", null, true);
             app.echoToOE("ARTWORK_LOADED");
-          `, 120000);
-          await new Promise(r => setTimeout(r, 2000));
+          `, 180000);
+          await new Promise(r => setTimeout(r, 3000));
 
           // Step c: Position artwork to fill SO canvas, merge, save, close
           const replaceResult = await runScript(page, `
@@ -341,9 +353,17 @@ async function waitForMessage(page, expected, timeoutMs = 60000) {
       return false;
     }, expected);
     if (found) return;
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 300));
   }
-  throw new Error(`Timeout waiting for message: ${expected}`);
+  // On timeout, dump queue contents for debugging
+  const queueInfo = await page.evaluate(() => {
+    return window.__msgQueue.map(m => {
+      if (typeof m === 'string') return m.substring(0, 200);
+      if (m instanceof ArrayBuffer) return `[ArrayBuffer ${m.byteLength} bytes]`;
+      return String(m).substring(0, 200);
+    });
+  }).catch(() => 'unable to read queue');
+  throw new Error(`Timeout waiting for message: ${expected}. Queue (${queueInfo.length} msgs): ${JSON.stringify(queueInfo)}`);
 }
 
 // ── Utils ────────────────────────────────────────────────────────────────────
