@@ -124,43 +124,61 @@ async function processRender(jobId, params) {
     page.on('console', (msg) => console.log(`[${jobId}] [${msg.type()}] ${msg.text()}`));
     page.on('pageerror', (err) => console.log(`[${jobId}] [pageerror] ${err.message}`));
 
-    // Build Photopea URL: load PSD + run replacement script + export via saveToOE.
+    // Build the replacement script (runs inside Photopea after PSD loads).
     const script = buildReplacementScript(replacements, output_format);
-    const config = { files: [psd_url], script };
-    const photopeaUrl = 'https://www.photopea.com#' + encodeURIComponent(JSON.stringify(config));
 
-    // Load a blank shell, then create a Photopea iframe. Photopea posts its
-    // echoToOE strings + saveToOE ArrayBuffer to window.parent (this shell),
-    // where the listener below captures them.
+    // Load a blank shell, then create a Photopea iframe (no hash config).
+    // Drive Photopea via postMessage: wait for "done", open PSD, run script,
+    // then saveToOE posts the ArrayBuffer to window.parent (this shell).
     await page.setContent('<!DOCTYPE html><html><body style="margin:0"></body></html>', { waitUntil: 'load' });
     console.log(`[${jobId}] creating Photopea iframe (${replacements.length} replacement(s))`);
 
-    const b64 = await page.evaluate(async (cfgUrl) => {
+    const b64 = await page.evaluate(async (psdUrl, fmt, replacementScript) => {
       const iframe = document.createElement('iframe');
-      iframe.src = cfgUrl;
+      iframe.src = 'https://www.photopea.com';
       iframe.style.cssText = 'width:100%;height:100vh;border:0;';
       document.body.appendChild(iframe);
+      const pp = iframe.contentWindow;
 
       const messages = [];
-      return await new Promise((resolve, reject) => {
+      window.addEventListener('message', (e) => {
+        if (typeof e.data === 'string') messages.push(e.data);
+      });
+
+      const waitFor = (target, timeoutMs = 120000) => new Promise((resolve, reject) => {
+        if (messages.includes(target)) return resolve();
         const to = setTimeout(() => {
           cleanup();
-          reject(new Error('Export timeout — no ArrayBuffer. Messages: ' + messages.slice(-30).join(' | ')));
-        }, 240000);
-        const h = (e) => {
-          if (e.data instanceof ArrayBuffer) {
-            cleanup();
-            const fr = new FileReader();
-            fr.onload = () => resolve(String(fr.result).split(',')[1]);
-            fr.readAsDataURL(new Blob([e.data]));
-          } else if (typeof e.data === 'string') {
-            messages.push(e.data);
-          }
-        };
+          reject(new Error('Timeout waiting for: ' + target + ' | seen: ' + messages.slice(-20).join(', ')));
+        }, timeoutMs);
+        const h = (e) => { if (e.data === target) { cleanup(); resolve(); } };
         const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
         window.addEventListener('message', h);
       });
-    }, photopeaUrl);
+
+      // 1. Wait for Photopea to signal it's ready
+      await waitFor('done');
+      // 2. Load the PSD
+      pp.postMessage('app.open(' + JSON.stringify(psdUrl) + '); app.echoToOE("psd_loaded");', '*');
+      await waitFor('psd_loaded');
+      // 3. Run the replacement script
+      pp.postMessage(replacementScript, '*');
+      await waitFor('script_done');
+      // 4. Export and capture the ArrayBuffer
+      const arrayBuffer = await new Promise((resolve, reject) => {
+        const to = setTimeout(() => { cleanup(); reject(new Error('Export timeout — no ArrayBuffer. Messages: ' + messages.slice(-20).join(', '))); }, 120000);
+        const h = (e) => { if (e.data instanceof ArrayBuffer) { cleanup(); resolve(e.data); } };
+        const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
+        window.addEventListener('message', h);
+        pp.postMessage('app.activeDocument.saveToOE(' + JSON.stringify(fmt) + ');', '*');
+      });
+      // 5. Convert to base64
+      return await new Promise((resolve) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(String(fr.result).split(',')[1]);
+        fr.readAsDataURL(new Blob([arrayBuffer]));
+      });
+    }, psd_url, output_format, script);
 
     if (!b64) throw new Error('No output returned from Photopea');
 
