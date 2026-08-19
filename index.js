@@ -72,20 +72,25 @@ console.log(`Available font families: ${JSON.stringify(GlobalFonts.families.map(
 // it under common aliases. Without this, ctx.fillText() draws nothing.
 async function ensureFontsAvailable() {
   if (GlobalFonts.families.length > 0) return;
-  console.log('No system fonts found — downloading DejaVu Sans…');
-  const fontUrls = [
-    { url: 'https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans.ttf', path: '/tmp/DejaVuSans.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'DejaVu Sans'] },
-    { url: 'https://cdn.jsdelivr.net/gh/dejavu-fonts/dejavu-fonts/ttf/DejaVuSans-Bold.ttf', path: '/tmp/DejaVuSans-Bold.ttf', aliases: ['Arial Bold', 'DejaVu Sans Bold'] },
+  console.log('No system fonts found — downloading fallback fonts…');
+  // Multiple sources in case one fails. Roboto from Google's official fonts
+  // repo (OFL) is reliable and has full Latin coverage.
+  const fontSources = [
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosans/NotoSans-Regular.ttf', path: '/tmp/NotoSans-Regular.ttf', aliases: ['Arial', 'Helvetica', 'sans-serif', 'Noto Sans'] },
+    { url: 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosans/NotoSans-Bold.ttf', path: '/tmp/NotoSans-Bold.ttf', aliases: ['Arial Bold', 'Noto Sans Bold'] },
   ];
-  for (const f of fontUrls) {
+  for (const f of fontSources) {
     try {
-      const res = await fetch(f.url);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      fs.writeFileSync(f.path, Buffer.from(await res.arrayBuffer()));
+      console.log(`Downloading font: ${f.url}`);
+      const res = await fetch(f.url, { redirect: 'follow' });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length < 1000) throw new Error(`File too small (${buf.length} bytes — likely 404 page)`);
+      fs.writeFileSync(f.path, buf);
       for (const alias of f.aliases) {
-        try { GlobalFonts.registerFromPath(f.path, alias); } catch (e) { /* ignore */ }
+        try { GlobalFonts.registerFromPath(f.path, alias); } catch (e) { console.warn(`Register alias "${alias}" failed: ${e.message}`); }
       }
-      console.log(`Registered ${f.path} as: ${f.aliases.join(', ')}`);
+      console.log(`Registered ${f.path} (${buf.length} bytes) as: ${f.aliases.join(', ')}`);
     } catch (e) {
       console.warn(`Failed to download font from ${f.url}: ${e.message}`);
     }
