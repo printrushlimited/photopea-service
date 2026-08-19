@@ -200,14 +200,14 @@ async function processRender(jobId, params) {
             if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
             const tInfo = replaceText(layer, rep.text);
             applied++;
-            matchLog.push({ ...diag, status: 'applied_text', text: rep.text, style: tInfo });
+            matchLog.push({ ...diag, status: 'applied_text', text: rep.text, style: tInfo, blend: layer.blendMode, clipping: !!layer.clipping, raw_text_data: JSON.stringify(layer.text?.style?.[0] || null).substring(0, 200) });
           } else if (rep.type === 'artwork') {
             const img = artworkCache.get(rep.image_url);
             if (!img) { matchLog.push({ ...diag, status: 'no_artwork_image' }); continue; }
             if (w <= 0 || h <= 0) { matchLog.push({ ...diag, status: 'skipped_no_bounds' }); continue; }
             const aInfo = replaceArtwork(layer, img);
             applied++;
-            matchLog.push({ ...diag, status: 'applied_artwork', img_dims: { w: img.width, h: img.height }, scale: aInfo?.scale });
+            matchLog.push({ ...diag, status: 'applied_artwork', img_dims: { w: img.width, h: img.height }, scale: aInfo?.scale, draw_dims: aInfo?.draw_dims, center_pixel: aInfo?.center_pixel, blend: layer.blendMode, clipping: !!layer.clipping });
           }
         } catch (e) {
           matchLog.push({ ...diag, status: 'error', error: e.message });
@@ -259,7 +259,7 @@ async function processRender(jobId, params) {
     for (const layer of layers) {
       const w = (layer.right || 0) - (layer.left || 0);
       const h = (layer.bottom || 0) - (layer.top || 0);
-      layerOrder.push({ name: layer.name, depth, blend: layer.blendMode || 'normal', opacity: layer.opacity, hidden: !!layer.hidden, has_canvas: !!layer.canvas, size: w > 0 ? `${w}x${h}` : null });
+      layerOrder.push({ name: layer.name, depth, blend: layer.blendMode || 'normal', opacity: layer.opacity, hidden: !!layer.hidden, has_canvas: !!layer.canvas, clipping: !!layer.clipping, size: w > 0 ? `${w}x${h}` : null });
       if (layer.children) logOrder(layer.children, depth + 1);
     }
   }
@@ -336,7 +336,7 @@ function replaceText(layer, text) {
 
   // Sample center pixel to verify text was drawn
   const px = ctx.getImageData(Math.floor(w / 2), Math.floor(h / 2), 1, 1).data;
-  return { font: fontName, fontSize, bold, italic, color: fillRGB, alignment, canvas_dims: { w, h }, center_pixel: [px[0], px[1], px[2], px[3]] };
+  return { font: fontName, fontSize, bold, italic, color: fillRGB, alignment, canvas_dims: { w, h }, center_pixel: [px[0], px[1], px[2], px[3]], top_left_pixel: (() => { const p = ctx.getImageData(2, 2, 1, 1).data; return [p[0], p[1], p[2], p[3]]; })() };
 }
 
 function replaceArtwork(layer, img) {
