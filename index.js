@@ -1,44 +1,31 @@
 /**
- * Photopea render service (async job pattern, URL-hash config).
+ * PSD Render Service (ag-psd)
  *
- * POST /render  → 202 { job_id } immediately (bypasses Railway gateway timeout)
- * GET  /status/:job_id → { status, result(base64), error, contentType }
+ * Server-side PSD rendering WITHOUT a browser. Parses PSD files, replaces
+ * artwork layers (smart objects / pixel layers) and text layers, then
+ * composites everything to a single PNG or JPEG.
  *
- * Loads Photopea in an IFRAME (the documented OE model: Photopea posts to
- * window.parent). The iframe src uses Photopea's URL hash config
- * {"files":[psd],"script":...} so Photopea auto-loads the PSD and runs the
- * replacement + saveToOE script with no "done" handshake and no postMessage
- * scripting from Node.
+ * This replaces the old Puppeteer + Photopea approach, which never worked
+ * because Photopea is a WebGL/WASM app that doesn't initialize in headless
+ * Chrome (it sends zero postMessages — see git history for the long saga).
+ *
+ * ag-psd is a pure-JS PSD parser. @napi-rs/canvas provides the canvas
+ * rasterization (prebuilt, no system deps needed).
+ *
+ * API (unchanged from v1 — Base44 backend function needs no changes):
+ *   POST /render  → 202 { job_id }            (async, bypasses gateway timeout)
+ *   GET  /status/:job_id → { status, result(base64), error, contentType }
  */
 const express = require('express');
-const puppeteer = require('puppeteer');
+const { readPsd } = require('ag-psd');
+const { createCanvas, loadImage } = require('@napi-rs/canvas');
 const crypto = require('crypto');
 
 const app = express();
 app.use(express.json({ limit: '256mb' }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const JOB_TTL_MS = 10 * 60 * 1000;
-
-let browser;
-async function getBrowser() {
-  if (!browser || !browser.isConnected()) {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      protocolTimeout: 300000,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--enable-wasm',
-        '--disable-features=StoragePartitioning,ThirdPartyStoragePartitioning',
-        '--disable-site-isolation-trials',
-      ],
-    });
-  }
-  return browser;
-}
 
 const jobs = new Map();
 setInterval(() => {
@@ -50,6 +37,8 @@ function newJobId() {
   return crypto.randomBytes(9).toString('base64url');
 }
 
+// ── Routes ───────────────────────────────────────────────────────────────────
+
 app.post('/render', (req, res) => {
   const { psd_url, output_format = 'jpg', replacements = [] } = req.body || {};
   if (!psd_url) return res.status(400).json({ error: 'psd_url is required' });
@@ -57,7 +46,9 @@ app.post('/render', (req, res) => {
   const jobId = newJobId();
   jobs.set(jobId, { status: 'pending', result: null, error: null, contentType: null, startedAt: Date.now() });
 
-  processRender(jobId, { psd_url, output_format, replacements });
+  processRender(jobId, { psd_url, output_format, replacements }).catch((err) => {
+    jobs.set(jobId, { status: 'error', result: null, error: err.message, contentType: null, startedAt: jobs.get(jobId).startedAt });
+  });
 
   return res.status(202).json({ job_id: jobId });
 });
@@ -68,158 +59,174 @@ app.get('/status/:jobId', (req, res) => {
   return res.json(job);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true }));
-app.get('/shell', (req, res) => res.send('<!DOCTYPE html><html><body style="margin:0"></body></html>'));
+app.get('/health', (req, res) => res.json({ ok: true, engine: 'ag-psd' }));
 
-function buildReplacementScript(replacements, output_format) {
-  return [
-    'var replacements = ' + JSON.stringify(replacements) + ';',
-    'var doc = app.activeDocument;',
-    'function walk(layers) {',
-    '  for (var i = 0; i < layers.length; i++) {',
-    '    var l = layers[i];',
-    '    if (l.children && l.children.length) { walk(l.children); continue; }',
-    '    for (var k = 0; k < replacements.length; k++) {',
-    '      var rep = replacements[k];',
-    '      if (l.name !== rep.layer_name) continue;',
-    '      if (rep.type === "text") { try {',
-    '        if (l.textItem) { l.textItem.contents = rep.text; }',
-    '        else if (l.text) { l.text.text = rep.text; }',
-    '      } catch (e) {} }',
-    '      else if (rep.type === "artwork") { try { replaceArtworkLayer(l, rep.image_url); } catch (e) {} }',
-    '    }',
-    '  }',
-    '}',
-    'function replaceArtworkLayer(layer, imageUrl) {',
-    '  var ob = layer.bounds;',
-    '  var ow = ob[2] - ob[0], oh = ob[3] - ob[1];',
-    '  var name = layer.name;',
-    '  layer.remove();',
-    '  app.open(imageUrl, undefined, true);',
-    '  var nl = app.activeDocument.activeLayer;',
-    '  if (!nl) return;',
-    '  var nb = nl.bounds;',
-    '  var nw = nb[2] - nb[0], nh = nb[3] - nb[1];',
-    '  if (nw > 0 && nh > 0) {',
-    '    var scale = Math.min(ow / nw, oh / nh) * 100;',
-    '    if (scale > 0) nl.resize(scale, scale);',
-    '  }',
-    '  var cb = nl.bounds;',
-    '  nl.translate(ob[0] - cb[0], ob[1] - cb[1]);',
-    '  nl.name = name;',
-    '}',
-    'walk(doc.layers);',
-    'app.echoToOE("script_done");',
-    'app.activeDocument.saveToOE(' + JSON.stringify(output_format) + ');'
-  ].join('\n');
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+async function loadImageFromUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Image download failed (${res.status}): ${url}`);
+  const buffer = Buffer.from(await res.arrayBuffer());
+  return loadImage(buffer);
 }
+
+// Map PSD blend modes → canvas globalCompositeOperation
+const BLEND_MODES = {
+  'normal': 'source-over',
+  'multiply': 'multiply',
+  'screen': 'screen',
+  'overlay': 'overlay',
+  'darken': 'darken',
+  'lighten': 'lighten',
+  'color dodge': 'color-dodge',
+  'linear dodge': 'lighter',
+  'difference': 'difference',
+  'exclusion': 'exclusion',
+  'hue': 'hue',
+  'saturation': 'saturation',
+  'color': 'color',
+  'luminosity': 'luminosity',
+};
 
 async function processRender(jobId, params) {
   const { psd_url, output_format, replacements } = params;
   const contentType = output_format === 'png' ? 'image/png' : 'image/jpeg';
-  let page;
-  try {
-    jobs.set(jobId, { ...jobs.get(jobId), status: 'processing' });
 
-    const b = await getBrowser();
-    page = await b.newPage();
-    await page.setViewport({ width: 1280, height: 900 });
-    page.on('console', (msg) => console.log(`[${jobId}] [${msg.type()}] ${msg.text()}`));
-    page.on('pageerror', (err) => console.log(`[${jobId}] [pageerror] ${err.message}`));
+  jobs.set(jobId, { ...jobs.get(jobId), status: 'processing' });
 
-    // Build the replacement script (runs inside Photopea after PSD loads).
-    const script = buildReplacementScript(replacements, output_format);
+  // 1. Download PSD
+  console.log(`[${jobId}] downloading PSD: ${psd_url}`);
+  const psdRes = await fetch(psd_url);
+  if (!psdRes.ok) throw new Error(`PSD download failed (${psdRes.status})`);
+  const psdBuffer = Buffer.from(await psdRes.arrayBuffer());
+  console.log(`[${jobId}] PSD downloaded (${(psdBuffer.length / 1024 / 1024).toFixed(1)} MB)`);
 
-    // Load a blank shell, then create a Photopea iframe (no hash config).
-    // Drive Photopea via postMessage: wait for "done", open PSD, run script,
-    // then saveToOE posts the ArrayBuffer to window.parent (this shell).
-    // Inject a localStorage shim into EVERY frame (including the cross-origin
-    // Photopea iframe) before any page script runs. Headless Chrome blocks
-    // localStorage for opaque-origin / partitioned third-party iframes, which
-    // crashes Photopea during init — it never sends the "done" signal.
-    await page.evaluateOnNewDocument(() => {
-      try {
-        const _ = window.localStorage;
-      } catch {
-        const store = {};
-        Object.defineProperty(window, 'localStorage', {
-          value: {
-            getItem: (k) => (k in store ? store[k] : null),
-            setItem: (k, v) => { store[k] = String(v); },
-            removeItem: (k) => { delete store[k]; },
-            clear: () => { Object.keys(store).forEach((k) => delete store[k]); },
-            key: (i) => Object.keys(store)[i] ?? null,
-            get length() { return Object.keys(store).length; },
-          },
-          configurable: true,
-        });
-      }
-    });
+  // 2. Parse with canvas support (creates canvases for ALL layers — backgrounds,
+  //    decorative layers, etc. — so we can composite the full PSD)
+  console.log(`[${jobId}] parsing PSD…`);
+  const psd = readPsd(psdBuffer, { canvas: { createCanvas, loadImage } });
+  console.log(`[${jobId}] parsed: ${psd.width}×${psd.height}, ${replacements.length} replacement(s)`);
 
-    await page.goto('http://localhost:' + PORT + '/shell', { waitUntil: 'load', timeout: 60000 });
-    console.log(`[${jobId}] creating Photopea iframe (${replacements.length} replacement(s))`);
-
-    const b64 = await page.evaluate(async (psdUrl, fmt, replacementScript) => {
-      const iframe = document.createElement('iframe');
-      iframe.src = 'https://www.photopea.com';
-      iframe.style.cssText = 'width:100%;height:100vh;border:0;';
-      document.body.appendChild(iframe);
-      const pp = iframe.contentWindow;
-
-      const messages = [];
-      window.addEventListener('message', (e) => {
-        if (typeof e.data === 'string') messages.push(e.data);
-      });
-
-      const waitFor = (target, timeoutMs = 120000) => new Promise((resolve, reject) => {
-        if (messages.includes(target)) return resolve();
-        const to = setTimeout(() => {
-          cleanup();
-          reject(new Error('Timeout waiting for: ' + target + ' | seen: ' + messages.slice(-20).join(', ')));
-        }, timeoutMs);
-        const h = (e) => { if (e.data === target) { cleanup(); resolve(); } };
-        const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
-        window.addEventListener('message', h);
-      });
-
-      // 1. Wait for Photopea to signal it's ready
-      await waitFor('done');
-      // 2. Load the PSD
-      pp.postMessage('app.open(' + JSON.stringify(psdUrl) + '); app.echoToOE("psd_loaded");', '*');
-      await waitFor('psd_loaded');
-      // 3. Run the replacement script
-      pp.postMessage(replacementScript, '*');
-      await waitFor('script_done');
-      // 4. Export and capture the ArrayBuffer
-      const arrayBuffer = await new Promise((resolve, reject) => {
-        const to = setTimeout(() => { cleanup(); reject(new Error('Export timeout — no ArrayBuffer. Messages: ' + messages.slice(-20).join(', '))); }, 120000);
-        const h = (e) => { if (e.data instanceof ArrayBuffer) { cleanup(); resolve(e.data); } };
-        const cleanup = () => { clearTimeout(to); window.removeEventListener('message', h); };
-        window.addEventListener('message', h);
-        pp.postMessage('app.activeDocument.saveToOE(' + JSON.stringify(fmt) + ');', '*');
-      });
-      // 5. Convert to base64
-      return await new Promise((resolve) => {
-        const fr = new FileReader();
-        fr.onload = () => resolve(String(fr.result).split(',')[1]);
-        fr.readAsDataURL(new Blob([arrayBuffer]));
-      });
-    }, psd_url, output_format, script);
-
-    if (!b64) throw new Error('No output returned from Photopea');
-
-    jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, startedAt: jobs.get(jobId).startedAt });
-    console.log(`[${jobId}] complete (${b64.length} b64 chars)`);
-  } catch (err) {
-    console.error(`[${jobId}] render failed:`, err.message);
-    let diag = err.message;
-    if (page) {
-      diag += ' | url: ' + await page.evaluate(() => window.location.href).catch(() => 'n/a');
+  // 3. Pre-load all artwork images
+  const artworkCache = new Map();
+  for (const rep of replacements) {
+    if (rep.type === 'artwork' && rep.image_url && !artworkCache.has(rep.image_url)) {
+      console.log(`[${jobId}] loading artwork: ${rep.image_url.substring(0, 80)}…`);
+      artworkCache.set(rep.image_url, await loadImageFromUrl(rep.image_url));
     }
-    jobs.set(jobId, { status: 'error', result: null, error: diag, contentType: null, startedAt: jobs.get(jobId).startedAt });
-  } finally {
-    if (page) await page.close().catch(() => {});
   }
+
+  // 4. Walk layers (bottom-to-top), apply replacements, composite to one canvas
+  const composite = createCanvas(psd.width, psd.height);
+  const ctx = composite.getContext('2d');
+
+  let applied = 0;
+  function drawLayers(layers) {
+    if (!layers) return;
+    for (const layer of layers) {
+      if (layer.hidden) continue;
+      // Children are below the parent — draw them first
+      if (layer.children) drawLayers(layer.children);
+
+      // Apply replacements by matching layer name
+      for (const rep of replacements) {
+        if (layer.name !== rep.layer_name) continue;
+        try {
+          if (rep.type === 'text') {
+            replaceText(layer, rep.text);
+            applied++;
+          } else if (rep.type === 'artwork') {
+            const img = artworkCache.get(rep.image_url);
+            if (img) { replaceArtwork(layer, img); applied++; }
+          }
+        } catch (e) {
+          console.error(`[${jobId}] replace "${layer.name}": ${e.message}`);
+        }
+      }
+
+      // Draw this layer's canvas onto the composite
+      if (layer.canvas) {
+        ctx.save();
+        ctx.globalAlpha = (layer.opacity ?? 255) / 255;
+        const mode = BLEND_MODES[layer.blendMode];
+        if (mode) ctx.globalCompositeOperation = mode;
+        ctx.drawImage(layer.canvas, layer.left || 0, layer.top || 0);
+        ctx.restore();
+      }
+    }
+  }
+
+  drawLayers(psd.children || []);
+  console.log(`[${jobId}] composited (${applied}/${replacements.length} replacements applied)`);
+
+  // 5. Export to PNG or JPEG
+  const outBuffer = output_format === 'png'
+    ? composite.toBuffer('image/png')
+    : composite.toBuffer('image/jpeg', 85);
+
+  const b64 = outBuffer.toString('base64');
+  jobs.set(jobId, { status: 'complete', result: b64, error: null, contentType, startedAt: jobs.get(jobId).startedAt });
+  console.log(`[${jobId}] complete (${(b64.length / 1024).toFixed(0)} KB b64)`);
 }
 
-app.listen(PORT, () => console.log(`Photopea render service listening on :${PORT}`));
+// ── Layer replacement helpers ────────────────────────────────────────────────
+
+function replaceText(layer, text) {
+  const w = (layer.right || 0) - (layer.left || 0);
+  const h = (layer.bottom || 0) - (layer.top || 0);
+  if (w <= 0 || h <= 0) return;
+
+  const canvas = createCanvas(w, h);
+  const ctx = canvas.getContext('2d');
+
+  // Extract text style from the PSD's text data
+  const style = layer.text?.style?.[0] || {};
+  const paraStyle = layer.text?.paragraphStyle || {};
+
+  const fontSize = Math.round(style.fontSize || 24);
+  let fontName = style.font?.name || 'Arial';
+  // Map common PostScript font names to CSS families
+  fontName = fontName.replace(/MT$|PS$|-Regular$|-Bold$|-Italic$|-BoldItalic$/g, '').replace(/-/g, ' ');
+
+  const bold = style.bold || /bold/i.test(style.font?.name || '');
+  const italic = style.italic || /italic/i.test(style.font?.name || '');
+  const fillRGB = style.fillColor?.[0]?.rgb || style.fillColor?.rgb || { r: 0, g: 0, b: 0 };
+  const alignment = paraStyle.alignment || style.alignment || 'left';
+
+  ctx.font = `${italic ? 'italic ' : ''}${bold ? 'bold ' : ''}${fontSize}px "${fontName}", Arial, sans-serif`;
+  ctx.fillStyle = `rgb(${fillRGB.r}, ${fillRGB.g}, ${fillRGB.b})`;
+  ctx.textBaseline = 'top';
+  ctx.textAlign = alignment === 'center' ? 'center' : alignment === 'right' ? 'right' : 'left';
+
+  // Multi-line text with vertical centering
+  const lines = text.split('\n');
+  const lineHeight = fontSize * 1.2;
+  const totalHeight = lines.length * lineHeight;
+  const startY = Math.max(0, (h - totalHeight) / 2);
+  const x = alignment === 'center' ? w / 2 : alignment === 'right' ? w : 0;
+
+  lines.forEach((line, i) => {
+    ctx.fillText(line, x, startY + i * lineHeight);
+  });
+
+  layer.canvas = canvas;
+}
+
+function replaceArtwork(layer, img) {
+  const w = (layer.right || 0) - (layer.left || 0);
+  const h = (layer.bottom || 0) - (layer.top || 0);
+  if (w <= 0 || h <= 0) return;
+
+  const canvas = createCanvas(w, h);
+  const ctx = canvas.getContext('2d');
+
+  // Contain: scale artwork to fit within layer bounds, centered
+  const scale = Math.min(w / img.width, h / img.height);
+  const dw = img.width * scale;
+  const dh = img.height * scale;
+  ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+
+  layer.canvas = canvas;
+}
+
+app.listen(PORT, () => console.log(`PSD render service (ag-psd) listening on :${PORT}`));
